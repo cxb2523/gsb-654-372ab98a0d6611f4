@@ -1,0 +1,163 @@
+// state.ts — from input (time, location, weather, filter) to renderer state
+//
+// This is effectively atmosphere's public interface:
+//   Conditions (what a human specifies) → AtmosphereState (what the renderer interprets)
+
+import { resolveCelestial, type Celestial, type CelestialInput } from './celestial.js';
+import { resolveFilter, type ColorFilter, type FilterInput } from './filter.js';
+import { resolveGround, type Ground, type GroundInput } from './ground.js';
+import { resolveLens, type Lens, type LensInput } from './lens.js';
+import { resolveSun, type Sun, type SunInput } from './sundisc.js';
+import { resolveSunset, type Sunset, type SunsetInput } from './sunset.js';
+import { resolveParticles, type Particles, type ParticlesInput } from './particles.js';
+import { resolvePolarizer, type Polarizer, type PolarizerInput } from './polarizer.js';
+import {
+  lunarEclipse, lunarPosition, nominalLunarPosition, nominalSolarPosition, solarPosition, type GeoLocation,
+} from './sun.js';
+import { toDate, toTimeOfDay, type TimeInput } from './time.js';
+import { resolveTone, type ToneCurve, type ToneInput } from './tone.js';
+import { resolveWeather, type WeatherInput, type WeatherState } from './weather.js';
+
+/**
+ * The camera: where the sky is being viewed from.
+ *
+ * All drawing happens along view rays cast from this camera, so drawing the
+ * 6 directions at fov=90° produces a cubemap (skybox) directly.
+ */
+export interface Camera {
+  /** view azimuth in radians. north=0, east=π/2, south=π */
+  yaw: number;
+  /** view elevation in radians. positive is upward */
+  pitch: number;
+  /** vertical field of view in radians */
+  fov: number;
+}
+
+/** A background-friendly framing where the horizon sits just below the frame (south-facing, 26° elevation, 49° fov) */
+export const DEFAULT_CAMERA: Camera = {
+  yaw: Math.PI,
+  pitch: 0.46,
+  fov: 0.86,
+};
+
+/** Cameras for the 6 skybox faces, in +X, -X, +Y, -Y, +Z, -Z order */
+export const CUBE_FACE_CAMERAS: readonly Camera[] = [
+  { yaw: Math.PI / 2, pitch: 0, fov: Math.PI / 2 },        // +X east
+  { yaw: -Math.PI / 2, pitch: 0, fov: Math.PI / 2 },       // -X west
+  { yaw: 0, pitch: Math.PI / 2, fov: Math.PI / 2 },        // +Y zenith
+  { yaw: 0, pitch: -Math.PI / 2, fov: Math.PI / 2 },       // -Y nadir
+  { yaw: 0, pitch: 0, fov: Math.PI / 2 },                  // +Z north
+  { yaw: Math.PI, pitch: 0, fov: Math.PI / 2 },            // -Z south
+];
+
+/** What a human specifies. Everything is optional; omitted fields keep their current value */
+export interface Conditions {
+  /** time of day. a 0..24 number / Date / "14:30" / ISO string */
+  time?: TimeInput;
+  /** observation site. When given, the real solar position is computed from `time` (as a Date) */
+  location?: GeoLocation | null;
+  /** weather, either a preset name or raw observation values */
+  weather?: WeatherInput;
+  /** color filter — a display-referred grade (sepia, mono, …) */
+  filter?: FilterInput;
+  /** tone curve — scene-referred: exposure, contrast, highlight shoulder */
+  tone?: ToneInput;
+  /** circular polarizer. Darkens the sky 90° from the sun and leaves the clouds alone */
+  polarizer?: PolarizerInput;
+  /** what is behind the air: light pollution, the Milky Way, meteors */
+  celestial?: CelestialInput;
+  /** what happens on the glass: raindrops on the lens */
+  lens?: LensInput;
+  /** what is drawn falling through the air: rain streaks and snowflakes */
+  particles?: ParticlesInput;
+  /** what lies below the horizon: the plain ground, or a sea that mirrors the sky */
+  ground?: GroundInput;
+  /** how hard the sky burns at sunset and magic hour */
+  sunset?: SunsetInput;
+  /** how big the sun's disc is drawn, and how much it glares */
+  sun?: SunInput;
+  /** camera (partial is fine) */
+  camera?: Partial<Camera>;
+}
+
+/** The state the renderer interprets. Every field is a number that can be interpolated */
+export interface AtmosphereState extends WeatherState {
+  /** 0..24, used for UI display and for how far clouds drift when time is moved */
+  timeOfDay: number;
+  /** solar elevation in radians. horizon=0 */
+  sunElevation: number;
+  /** solar azimuth in radians. north=0, east=π/2 */
+  sunAzimuth: number;
+  /** lunar elevation in radians. horizon=0, negative when set */
+  moonElevation: number;
+  /** lunar azimuth in radians. north=0, east=π/2 */
+  moonAzimuth: number;
+  /** the illuminated fraction of the moon's disc, 0..1 (0 new, 1 full) */
+  moonPhase: number;
+  /**
+   * how much of the moon's disc stands in the Earth's umbra, 0..1 — 1 in a
+   * total eclipse. Only ever nonzero for a real date and place
+   */
+  moonEclipse: number;
+  filter: ColorFilter;
+  tone: ToneCurve;
+  polarizer: Polarizer;
+  celestial: Celestial;
+  lens: Lens;
+  particles: Particles;
+  ground: Ground;
+  sunset: Sunset;
+  sun: Sun;
+}
+
+export const DEFAULT_CONDITIONS: Required<Pick<Conditions, 'time' | 'weather'>> = {
+  time: 12,
+  weather: 'clear',
+};
+
+/** Resolve a specification into the state the renderer can be given */
+export function resolveConditions(c: Conditions): AtmosphereState {
+  const time = c.time ?? DEFAULT_CONDITIONS.time;
+  const timeOfDay = toTimeOfDay(time);
+  const date = toDate(time);
+
+  // Use the real solar position only when both a location and a date are
+  // available; otherwise fall back to "nowhere in particular, mid-northern latitude"
+  const sun = c.location && date
+    ? solarPosition(date, c.location)
+    : nominalSolarPosition(timeOfDay);
+  // the moon follows the same rule: real when it can be, a full moon
+  // opposite the sun otherwise
+  const moon = c.location && date
+    ? lunarPosition(date, c.location)
+    : nominalLunarPosition(timeOfDay);
+  // and an eclipse of it when the calendar has one: the nominal moon is
+  // always full and opposite the sun, which would put it in the shadow every
+  // night, so it never is
+  const moonEclipse = c.location && date ? lunarEclipse(date).umbra : 0;
+
+  return {
+    timeOfDay,
+    sunElevation: sun.elevation,
+    sunAzimuth: sun.azimuth,
+    moonElevation: moon.elevation,
+    moonAzimuth: moon.azimuth,
+    moonPhase: moon.phase,
+    moonEclipse,
+    ...resolveWeather(c.weather ?? DEFAULT_CONDITIONS.weather),
+    filter: resolveFilter(c.filter),
+    tone: resolveTone(c.tone),
+    polarizer: resolvePolarizer(c.polarizer),
+    celestial: resolveCelestial(c.celestial),
+    lens: resolveLens(c.lens),
+    particles: resolveParticles(c.particles),
+    ground: resolveGround(c.ground),
+    sunset: resolveSunset(c.sunset),
+    sun: resolveSun(c.sun),
+  };
+}
+
+/** Fill in a partially-specified camera */
+export function resolveCamera(c?: Partial<Camera> | null): Camera {
+  return { ...DEFAULT_CAMERA, ...c };
+}

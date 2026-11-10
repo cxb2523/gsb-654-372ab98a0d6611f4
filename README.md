@@ -1,0 +1,1182 @@
+English | [日本語](README.ja.md)
+
+# Atmosphere - a sky simulator
+
+**Pass in a time and a weather, and it roughly reproduces that sky.**
+One WebGL fragment shader, no dependencies, no DOM or framework dependency.
+See the samples in `examples/` to see it in action.
+
+```ts
+import { Atmosphere } from '@takustaqu/atmosphere';
+
+const sky = new Atmosphere(canvas, {
+  time: new Date(),
+  location: { latitude: 35.68, longitude: 139.77 },
+  weather: { cloudCover: 0.95, precipitation: 12, windSpeed: 18 },
+});
+```
+
+This keeps drawing Tokyo's sky at that day and hour, with 95% cloud cover,
+12mm/h of rain and 18m/s of wind. Calling `sky.set({ ... })` transitions
+smoothly to a new weather over a few seconds.
+
+It started as a side feature added while personally porting a certain game.
+It isn't a physical weather simulation, so it isn't accurate — but it should
+be an easy way to get a sky that keeps changing procedurally.
+
+## What it draws
+
+- **Time of day** — the sky's gradient, the sun (an outline-less blown-out glare,
+  or smaller and bare — see [The sun](#the-sun)),
+  sunset/magic-hour mauve, city lights at night
+- **The night sky** — light pollution on the Bortle scale, a Milky Way made of
+  resolved stars with its bulge and Great Rift, meteor showers at a ZHR with the
+  odd fireball, zodiacal light after dusk at a dark site
+- **The moon** — where the ephemeris puts it, lit by the sun from where the sun is, so
+  the phase and the tilt of the horns follow from the date; earthshine and maria;
+  the disc occludes the stars behind it; up by day too. Lunar eclipses happen on
+  their dates: the disc goes a dim copper red by how much of it is in the Earth's
+  umbra, and its light on the clouds fades with it
+- **The aurora** — curtains toward the north that fold and shimmer, green with red tops,
+  coming overhead as the activity rises
+- **The ten cloud genera** — cirrus, cirrostratus, cirrocumulus, altostratus,
+  altocumulus, nimbostratus, stratus, stratocumulus, cumulus, cumulonimbus.
+  A perspective projection from the intersection of the view ray and each
+  cloud plane gives depth by altitude
+- **Cumulus on a level base** — every lump stands on the same flat base, a
+  shaded blue-grey underside under a sunlit top, the line between them
+  following the lump's form; the flat bottoms stack into rows toward the
+  horizon, and ragged fractus drift at the lumps' margins. Toward the sun a
+  lump's core goes dark and its margin glows. Margins thin out into fine fibres
+  combed along the wind, further on the downwind side, fading to nothing
+- **Flocks of cloudlets** — cirrocumulus and altocumulus are many small soft grains
+  lined up in combed streaks. A patch has no outline: toward its margin the grains
+  shrink and part with sky between them, thin ones nearly sky-coloured, thick ones whiter
+- **Cumulonimbus anvils** — a tower that reaches the tropopause spreads out horizontally
+- **Cloud lighting** — pseudo shading toward the sun, silver lining,
+  blue-grey shadow from continuous thickness, flattening to diffuse light under overcast.
+  A cumulonimbus or cumulus standing against the sun is backlit: a dark mass with
+  only its rim blazing in the sun's color. Under a sun well up a cumulus is modelled
+  instead: a bright top with broad soft folds of grey, its near flank and underside
+  one dark mass lightening to a thin bright far rim
+- **Cloud shape evolution** — the domain-warp field itself moves, so clouds billow and collapse in place
+- **Precipitation** — rain (leaning with the wind), snow (tumbling on the wind), droplets on the lens
+  (both switchable — see [Falling rain and snow](#falling-rain-and-snow) and [Lens](#lens))
+- **Severe weather** — lightning that shows its bolt now and then, cloud turbulence from high wind,
+  and rain shafts hanging under a distant thunderhead or rain deck — virga that evaporates on
+  the way down, or a curtain that reaches the ground
+- **Optics** — the 22° halo, a sun pillar and the circumzenithal arc through cirrostratus,
+  parhelia (sun dogs) now and then where thin ice cloud passes level with a low sun, a moon halo and corona,
+  iridescence on thin cloud edges near the sun,
+  and a rainbow with its secondary and Alexander's band when the sun is out in the rain
+- **The sea** — optionally, open water below the horizon that mirrors the sky, with a swell,
+  the sun's path across it, whitecaps in a high wind, cloud shadows on the water and the
+  rainbow's reflection (see [Ground](#ground--the-sea))
+- **Visibility** — haze/mist/fog. Thin haze only crushes the horizon; thick haze covers the whole sky
+- **Lens flare** — ghosts along the optical axis, chromatic aberration, anamorphic-style streaks
+  (switchable, as is the vignette — see [Lens](#lens))
+- **Color filters** — sepia, monochrome, cyanotype, and more
+- **Photographic controls** — a tone curve over the linear-light composite,
+  and a circular-polarizer emulation
+
+## Setting the weather
+
+Weather is accepted **in observation units, as-is**.
+If you want to match a real condition, passing a weather report's numbers straight through can be fun too.
+
+| property | unit | meaning |
+|:---|:---|:---|
+| `cloudCover` | 0..1 | total cloud cover (divide oktas by 8). 0 gives a clear sky |
+| `clouds` | — | amount of each of the ten cloud genera. Overrides `cloudCover` when given |
+| `precipitation` | mm/h | precipitation rate |
+| `precipitationType` | `'rain'` \| `'snow'` | precipitation type |
+| `windSpeed` | m/s | surface wind speed |
+| `thunder` | 0..1 | lightning activity |
+| `visibility` | km | visibility |
+| `icePlates` | 0..1 | a floor under how settled the ice's plates are: 1 holds parhelia on wherever there is ice for them (default 0, the sky decides) |
+| `convection` | 0..1 | convective development (shorthand for `clouds.cumulonimbus`) |
+
+The named presets are defined with the same observation values, so presets and raw observations are on a continuum.
+
+| id | name | cloud cover | precipitation | wind | visibility | thunder |
+|:---|:---|--:|--:|--:|--:|--:|
+| `clear` | Clear | 0 | — | 2 | 45 | — |
+| `fair` | Fair | 0.22 | — | 3 | 35 | — |
+| `summer` | Summer sky | 0.38 | — | 3 | 25 | — |
+| `dappled` | Dappled (a sheet of altocumulus) | from its clouds | — | 4 | 25 | — |
+| `overcast` | Overcast | 0.82 | — | 5 | 15 | — |
+| `fog` | Fog | 0.75 | — | 1 | 0.6 | — |
+| `rain` | Rain | 0.95 | 8 | 7 | 8 | 0.08 |
+| `thunderstorm` | Thunderstorm | 0.97 | 25 | 12 | 5 | 1.0 |
+| `snow` | Snow | 0.90 | 3 (snow) | 3 | 4 | — |
+| `typhoon` | Typhoon | 1.0 | 40 | 30 | 6 | 0.5 |
+
+```ts
+sky.set({ weather: 'typhoon' });                          // preset
+sky.set({ weather: { cloudCover: 0.4, windSpeed: 9 } });  // observation
+```
+
+## Passing clouds — the ten genera
+
+Cloud cover alone doesn't decide what the clouds look like. At the same 80%
+cloud cover, a sky full of altocumulus and a flat sheet of nimbostratus are
+completely different. Since a sky can show several genera at once, instead of
+picking one "lead" genus, **amounts 0..1 for each genus are layered together**.
+
+```ts
+sky.set({ weather: { clouds: { cirrus: 0.5, cumulus: 0.3 } } });  // cotton clouds under cirrus
+sky.set({ weather: { clouds: ['altocumulus'] } });                // a sky of nothing but altocumulus
+```
+
+| id | name | nickname | altitude | form |
+|:---|:---|:---|:---|:---|
+| `cirrus` | Cirrus | Mare's tail | high | filament |
+| `cirrostratus` | Cirrostratus | Veil cloud | high | stratiform (halos the sun) |
+| `cirrocumulus` | Cirrocumulus | Mackerel sky | high | granular (fine) |
+| `altostratus` | Altostratus | Grey veil | mid | stratiform |
+| `altocumulus` | Altocumulus | Sheep cloud | mid | granular (medium) |
+| `nimbostratus` | Nimbostratus | Rain cloud | mid | stratiform (dark grey, rain) |
+| `stratus` | Stratus | Fog cloud | low | stratiform (hangs low) |
+| `stratocumulus` | Stratocumulus | Roll cloud | low | granular (large, roll-shaped) |
+| `cumulus` | Cumulus | Cotton cloud | low | convective |
+| `cumulonimbus` | Cumulonimbus | Thunderhead | low | convective (with an anvil) |
+
+When `clouds` isn't given, a plausible genus mix is built from cloud cover,
+precipitation, convection, and visibility (`defaultCloudMix`). A weather API
+returns cloud cover, not genera, so that pass-through path lands here. It
+follows an ordinary sky's makeup: cotton clouds and cirrus when clouds are
+sparse, stratocumulus and altostratus as they thicken, nimbostratus once it's raining.
+
+## Time and location
+
+`time` accepts a `0..24` number, a `Date`, `"14:30"`, or an ISO string.
+
+Pass `location` (latitude/longitude) alongside it, and the **real solar
+position** (azimuth and elevation) is computed from `time` (as a `Date`)
+using NOAA's formula. Latitude changes the peak elevation; season changes day length.
+
+```ts
+sky.set({ time: '2026-12-21T16:00Z', location: { latitude: 64.1, longitude: -21.9 } });
+// Reykjavik, winter solstice, 16:00 → already night
+```
+
+The moon follows the same rule: with a location and a date it stands where the
+lunar ephemeris puts it (good to about a degree), lit by the sun from where the
+sun actually is — so the phase, which limb is bright and how the horns tilt all
+follow from the date, and its light on the clouds grows with the phase and
+goes when it sets. Without a date it is a full moon opposite the sun: rising
+at sunset, high at midnight, gone by day.
+
+Without `location`, the sun rises in the east at 6:00, souths at 12:00, and
+sets in the west at 18:00 — "nowhere in particular, mid-northern latitude" (peak elevation 46°).
+
+### Time zones
+
+There is no time zone parameter, and `location` is not one. Latitude and
+longitude place the sun in the sky; they say nothing about which clock your
+`time` is on.
+
+A `Date` is an absolute instant, so the solar position derived from it is
+correct wherever the code runs. Everything else resolves against the **host's**
+local time zone: an ISO string with no offset (`'2026-07-26T14:30'`) is read as
+the host's local time, not the site's, and the time of day is taken from the
+host's clock.
+
+So to render 14:30 *in Tokyo* from a machine in London, state the offset:
+
+```ts
+sky.set({ time: '2026-07-26T14:30+09:00', location: { latitude: 35.68, longitude: 139.77 } });
+```
+
+`new Date()` needs no special handling — the current instant is the current
+instant everywhere.
+
+## Color filters
+
+A film-style grading: collapse to luminance, then re-tint any color.
+Sepia is just one preset of this — not a special case.
+
+| id | name | use |
+|:---|:---|:---|
+| `none` | None | |
+| `sepia` | Sepia | flashback |
+| `mono` | Monochrome | fully desaturated |
+| `faded` | Faded | some saturation kept, lifted blacks, low contrast |
+| `cyanotype` | Cyanotype | cool, blueprint-style monotone |
+| `gold` | Gold | warm, golden tint |
+| `ash` | Ash | slightly blue-tinted grey |
+
+```ts
+sky.set({ filter: 'cyanotype' });                     // full strength
+sky.set({ filter: { id: 'sepia', amount: 0.6 } });    // dialed down
+sky.set({ filter: { tint: [1.1, 0.9, 1.0], saturation: 0.2, lift: 0.05 } });  // custom color
+```
+
+Switching filters interpolates the color too, so sepia flows smoothly into cyanotype.
+
+## Camera / skybox
+
+All drawing happens along **view rays cast from the camera**. Sky color, clouds,
+sun, moon, and stars are all resolved as "what's visible in that direction" —
+the only things left in screen space are lens effects (droplets, flare, vignette).
+
+```ts
+sky.set({ camera: { yaw: Math.PI / 2 } });   // face east; sun position and cloud drift follow
+```
+
+`yaw` is azimuth (north=0, east=π/2), `pitch` is elevation, `fov` is vertical
+field of view. The default is "facing south, 26° elevation, 49° fov" — a
+background-friendly framing where the horizon sits just below the frame.
+
+Set `fov` to 90° and draw the 6 directions, and you get a cubemap. Cameras
+for those 6 faces live in `CUBE_FACE_CAMERAS`.
+
+```ts
+import { AtmosphereRenderer, CUBE_FACE_CAMERAS, resolveConditions } from '@takustaqu/atmosphere';
+
+const renderer = new AtmosphereRenderer(canvas);   // a square canvas
+const state = resolveConditions({ time: 16.5, weather: 'summer' });
+renderer.resize(512, 512);
+for (const face of CUBE_FACE_CAMERAS) {
+  renderer.render(0, state, face);
+  // bake it with gl.readPixels, toDataURL, or similar
+}
+```
+
+`renderCubeFaces` is that loop in one call.
+
+```ts
+import { renderCubeFaces } from '@takustaqu/atmosphere';
+
+const faces = renderCubeFaces({ time: 16.5, weather: 'summer' }, { size: 512 });
+```
+
+It returns 6 square 2D canvases in `CUBE_FACE_CAMERAS` order (+X east, -X west,
++Y zenith, -Y nadir, +Z north, -Z south), ready for `drawImage`, `toDataURL`, or
+uploading as cube-map faces. It creates and disposes a throwaway WebGL context
+per call, so it's for baking on a scene change, not for calling every frame
+(it throws when WebGL isn't available).
+
+Each face is drawn as a frame is, lens and all: give the conditions
+`lens: { droplets: false, flare: false, vignette: false }` for a skybox with
+nothing of the camera in it.
+
+## The night sky — light pollution, the Milky Way, meteors
+
+The counterpart to `weather`. Weather is what the air is doing; `celestial` is
+what is behind it. They are separate axes because they are independent — a meteor
+shower is not a weather condition, and the same shower looks like nothing at all
+under cloud.
+
+```ts
+sky.set({ celestial: 'perseids' });
+sky.set({ celestial: { bortle: 3 } });                  // Milky Way follows from it
+sky.set({ celestial: { bortle: 2, meteors: 40 } });
+```
+
+Units follow the same rule as weather: whatever the observation is actually
+measured in.
+
+| property | unit | meaning |
+|:---|:---|:---|
+| `bortle` | 1..9 | the **Bortle dark-sky scale**. Drives star density and the horizon glow of city light. Defaults to 6 — the bright suburban sky this has always drawn |
+| `milkyWay` | 0..1 | visibility. Derived from `bortle` when not given: gone by Bortle 6, which is why the default sky has never shown one |
+| `meteors` | /h | **ZHR** (zenithal hourly rate). ~5 is the sporadic background; the Perseids peak near 100, the Geminids near 150. Defaults to 0. **A ZHR counts the whole sky** and a frame covers under a fifth of it, so an honest 150 puts one in shot every few minutes — use values in the thousands if you want them watchable |
+| `radiant` | `[elevation, azimuth]` | where a shower's meteors stream from. `null` gives sporadics, from anywhere |
+| `aurora` | 0..1 | how much aurora is in the sky. 0 is none; a little is a faint green arc low in the north, 1 a display that folds overhead with red tops and a purple fringe. Not an observation unit — the Kp index says how disturbed the field is, not what a given sky shows. The curtains stand toward the north, and the default framing faces south: turn the camera (`camera: { yaw: 0 }`) |
+
+Presets: `dark-sky` `rural` `suburban` `city` `perseids` `geminids` `aurora`.
+
+The default is a no-op — `celestial: 'suburban'` is pixel-identical to omitting it
+entirely, so nothing about the existing sky changes until you ask for something.
+
+Two things are worth knowing about how these are drawn:
+
+**The Milky Way is made of stars.** The band raises the local star density rather
+than painting a luminous stripe; the diffuse glow is only the unresolved
+remainder. Drawn the other way it reads as an airbrushed diagonal, which is
+exactly what it looked like before this was fixed. It is additive light in linear
+space — a faint band over a near-black sky is precisely the case that goes wrong
+in gamma-encoded compositing.
+
+**The aurora is a curtain, marched.** A curtain is a vertical sheet of light
+standing between two altitudes, so a ray crosses it along some length of the
+sheet — seen edge-on it is a bright rib, seen face-on a faint veil, and that
+is what the folds are. It is marched in a few steps of altitude, each step
+projecting the ray onto that altitude's plane the way the cloud planes do and
+asking how close it lands to the curtain's wandering line; vertical rays
+shimmer along it. Green at the foot, red at the top, purple below at high
+activity. It hangs in front of the stars, under the same cloud, and a sea
+mirrors it.
+
+**Meteors are events, not objects.** They run on the same machinery as lightning:
+chop the clock into slots, hash each one, fire if it clears the threshold. They
+are drawn in ray space, so a meteor stays where it is in the sky as the view
+swings rather than being glued to the frame.
+
+> Under `prefers-reduced-motion: reduce` the `Atmosphere` loop draws a single
+> still frame, so `meteors` is forced to 0 there — a streak caught mid-flight
+> would sit on the sky as a scratch. Driving `AtmosphereRenderer` yourself, that
+> is your call to make.
+
+## Sunset
+
+How hard the sky burns. The colors of a sunset are a chain of physics the
+renderer only sketches — the aerosol in the air, how far the light has come,
+what it has scattered off — and two skies at the same hour differ by a lot.
+Rather than pretend to compute that, this axis says how much.
+
+```ts
+sky.set({ sunset: { warmth: 1.4 } });        // a redder, harder sunset
+sky.set({ sunset: { glow: 0.3 } });          // a magic hour that stays blue away from the sun
+sky.set({ sunset: { warmth: 1, glow: 1 } });  // the defaults
+```
+
+| field | what it does |
+|:---|:---|
+| `warmth` | 0..2 the band on the sun's side: its strength, its red, how high it climbs. 0 drains the color out, 2 is a hard red haze. Also tints the sun's light on the clouds. Defaults to 1 |
+| `glow` | 0..2 what the rest of the sky takes at magic hour: the pink of the far side and the lavender above the band. 0 leaves the far side cold, 2 lights the whole sky. Defaults to 1 |
+
+Both ease like everything else.
+
+## The sun
+
+The sun is drawn as an overexposure, not a disc: a core about 3.4° across —
+six times the real sun — blown flat white, and a wide glare round it. That is
+on purpose, and it stays the default: a sun you cannot look at is what the eye
+reports. An app that draws its own glare over the sky — streaks, a bloom, a
+flare of its own — wants the sun small and bare underneath it.
+
+```ts
+sky.set({ sun: { disc: 0.53 } });            // the sun at its true size
+sky.set({ sun: { glare: 0 } });              // no bleed of light round it
+sky.set({ sun: { disc: 0.53, glare: 0 } });  // both: a bare, true-size sun to draw over
+```
+
+| field | what it does |
+|:---|:---|
+| `disc` | the angular diameter, in degrees, of the sun's blown core — the part drawn flat white at full emission, before the tone curve. 0.1..10. Defaults to `DEFAULT_SUN_DISC` (about 3.39); `TRUE_SUN_DISC` is the real sun's 0.53. Its soft edge scales with it, and on screen it still blooms past it: at the default exposure what reads as white is nearly twice the diameter given |
+| `glare` | 0..1 the wide bleed of light round the disc, in the sky and in the sun's path on the sea. 0 leaves the disc bare. Defaults to 1 |
+
+Both ease like everything else. They are part of the sky, not the lens, so the
+sea's mirror, a `renderCubeFaces` skybox and the light probe all see the sun as
+drawn: a smaller, bare sun puts less of its light into what the probe measures
+(the sun's directional light is unchanged). The sky's own brightening toward the
+sun and the clouds lit through from behind it are the air's, and stay. Measured
+at 1920×1080 with a 1.05 rad fov, the sun in shot at noon: the near-white
+(≥250) patch is about 109 px across by default, 17 px at `disc: 0.53`; `glare: 0`
+takes the sky 100–300 px out from the sun from a mean level of 147 down to 109.
+
+## Tone curve
+
+Scene-referred, unlike the color filters below: these act on linear scene light
+before it becomes display values, which is the only place they mean anything. A
+multiply in linear light is an exposure; the same multiply on gamma-encoded values
+is just an odd darkening.
+
+```ts
+sky.set({ tone: 'filmic' });
+sky.set({ tone: { exposure: 0.4, contrast: 1.15 } });
+sky.set({ tone: { id: 'punch', bleach: 0.3 } });
+```
+
+| field | what it does |
+|:---|:---|
+| `exposure` | stops. 0 unchanged, +1 is twice the light |
+| `contrast` | pivoted on 18% grey. 1 unchanged |
+| `knee` | where the highlight shoulder starts. **Identity below it**, so the default 0.8 shapes only blown highlights |
+| `bleach` | 0..1 highlight desaturation toward white — what film does, and what stops a bright sky clipping into a muddy cast |
+
+Presets: `neutral` `flat` `punch` `filmic` `blown`.
+
+The knee is the important one. At 0.8 the published look is untouched; bring it
+down to put the curve through the midtones, and that is where it becomes a look.
+The same shoulder is what expands into `headroom` when there is HDR to expand
+into, so a curve dialled in now stays the curve later.
+
+## Circular polarizer
+
+A CPL emulation — not a grade. It is an optical filter, so it is a transmission
+multiply on scene light, applied to the sky gradient *before* the clouds, sun,
+moon and stars composite over it.
+
+```ts
+sky.set({ polarizer: 'strong' });
+sky.set({ polarizer: { strength: 0.6, angle: Math.PI / 4 } });
+sky.set({ polarizer: true });    // shorthand for a light CPL
+```
+
+The physics it follows: Rayleigh-scattered skylight is partially polarized, most
+strongly 90° from the sun (`sin²θ / (1 + cos²θ)`), while cloud light is Mie-scattered
+off droplets and comes out essentially unpolarized — as does direct sunlight. So
+the filter darkens the sky and leaves the clouds alone, which is the whole reason
+to carry one. Measured on a clear noon sky facing away from the sun at
+`strength: 0.9`:
+
+| | luma vs unfiltered |
+|:---|---:|
+| clear sky, `angle: 0` | **62%** |
+| clear sky, `angle: π/2` | **126%** |
+| overcast (all cloud) | **99.8%** |
+
+Clouds pop because the sky behind them dropped, not because they got brighter.
+
+The ring is aimed for you, the way a photographer aims it: turned so that the
+middle of the frame is darkened most, whatever the framing and wherever the sun
+is. `angle` is a turn from there, sweeping smoothly between those extremes with
+a period of 180°. The aim is only exact at the middle — the polarization
+direction rotates across the frame, so a wide shot picks up an uneven band of
+darkening, a real artifact of the real filter, reproduced. Where the sky is
+barely polarized — toward the sun and straight away from it — no turn of the
+ring does much, on this one or a real one.
+
+| field | what it does |
+|:---|:---|
+| `strength` | 0..1 how much of the polarized component is rejected |
+| `angle` | rotation in radians, from the aimed orientation. 0 darkens, π/2 brightens |
+| `saturation` | 0..1 extra saturation on what survives (the white veil goes with the polarized part) |
+| `stopLoss` | 0..1 how much of the real ~1.3-stop loss to apply. Defaults to 0 — emulating the loss without the exposure compensation just makes the picture dark |
+
+Presets: `none` `light` `strong` `crossed`.
+
+## Lens
+
+What happens on the glass rather than in the sky: the raindrops that collect
+on the lens while it rains — they bead up, bend the sky behind them, and dry off
+again — the flare the sun throws across the frame, and the vignette. All three
+are on by default. A sky behind a UI often wants the rain without the water on
+an imaginary camera; an app that draws its own flare and glare over the sky
+wants neither of the lens's own.
+
+```ts
+sky.set({ lens: { droplets: false } });                 // rain through clean glass
+sky.set({ lens: { droplets: 0.4 } });                   // fainter droplets
+sky.set({ lens: { flare: false, vignette: false } });   // no flare, no vignette
+sky.set({ lens: { droplets: true } });                  // back to the default
+```
+
+| field | what it does |
+|:---|:---|
+| `droplets` | 0..1 (or a boolean) ceiling on the lens droplets. They still follow the rain, so a dry sky shows none at any value. Defaults to 1 |
+| `flare` | 0..1 (or a boolean) strength of the lens flare: the ghosts along the optical axis, the faint ring and the horizontal streak while the sun is in shot. Defaults to 1 |
+| `vignette` | 0..1 (or a boolean) strength of the darkening toward the corners. Defaults to 1 |
+
+Changing them eases over the same few seconds as everything else, so switching
+the droplets off lets the drops on the glass dry away instead of vanishing. At 0
+the droplet pass and the flare are skipped outright, not just drawn invisibly.
+The environment the light probe measures leaves the flare and the vignette out
+whatever these say; `renderCubeFaces` draws its faces as a frame, so pass it
+`lens: { flare: false, vignette: false }` for a skybox without them.
+
+## Falling rain and snow
+
+The rain streaks and snowflakes drawn falling through the air. Like everything
+but the lens, they are laid out along the view ray, so they turn with the sky
+when the camera moves; looking up, the rain converges on the zenith and the
+snow falls toward you. They are on by default.
+
+Switching them off takes away only what falls: the weather stays. A rain cloud
+is as dark and heavy snow whites out the view just the same — useful for a snowy
+day behind text that flakes should not cross.
+
+```ts
+sky.set({ particles: { precipitation: false } });   // the weather, without anything falling
+sky.set({ particles: { precipitation: 0.4 } });     // fainter rain and snow
+sky.set({ particles: { precipitation: true } });    // back to the default
+```
+
+| field | what it does |
+|:---|:---|
+| `precipitation` | 0..1 (or a boolean) ceiling on the falling rain and snow. They still follow the weather, so a dry sky shows none at any value. Defaults to 1 |
+| `contrails` | 0..1 (or a boolean) how often a jet draws a trail across the high sky: a thin sharp line lengthening behind the plane, spreading into a soft band and dissolving over the minutes after. Drawn with the high clouds, so a deck hides it. Defaults to 0 |
+
+It eases like everything else, so the rain thins out rather than stopping dead.
+At 0 the particle passes are skipped, not drawn invisibly.
+
+## Ground — the sea
+
+What lies below the horizon. By default it is a plain plate of ground, out of
+frame in the default framing and there for the skybox's lower hemisphere and
+for anyone who tilts the camera down. Ask for a sea and that lower half is open
+water to the horizon.
+
+```ts
+sky.set({ ground: 'sea' });                  // open water, a light swell on it
+sky.set({ ground: { swell: 0.9 } });         // the sea, heaving more
+sky.set({ ground: 'land' });                 // back to the default
+```
+
+| field | what it does |
+|:---|:---|
+| `sea` | 0..1 how much of the ground is water. 0 is the plain ground, 1 a sea to the horizon; between the two it cross-fades. An object without it means 1 |
+| `swell` | 0..1 how much the water heaves. 0 is glass, 1 a long, heavy swell. The chop on top follows the wind on its own. Defaults to 0.4 |
+
+The sea is a mirror laid flat, and it is drawn as one: each ray that meets
+the water is reflected and asked what the sky is in that direction, so the
+sea takes the color of its hour exactly — blue at noon, rose under the Belt of
+Venus, grey under an overcast, leaden in a storm. The sun and the moon lay a
+path across it, their image scattered along the wind by the slopes of the
+waves. Fresnel decides how much of the mirror is seen: nearly all of it at a
+grazing look, next to none straight down, where the water's own dark
+green-blue shows instead. A [polarizer](#circular-polarizer) cuts the glare
+off it, fully at Brewster's angle, which is the other half of why one is
+carried.
+
+Only the sky's own color is mirrored, plus the sun, the moon and the city
+glow — not the clouds. At the grazing angles where the mirror is strong the
+sky it mirrors is the near-horizon sky, where the clouds have already faded;
+where the clouds would show, the mirror has gone weak. The horizon is a hard
+line, unlike the ground's. Above it the sea costs nothing: the gate is on the
+ray.
+
+Changing it eases like everything else, so the water rises over the ground
+rather than appearing. With a [light probe](#light-for-the-foreground) on,
+`environment.ground` becomes the sea's light.
+
+## Light for the foreground
+
+Something usually stands in front of the sky — an avatar, a product shot, a
+card — and it only belongs there if the same light falls on it: a rim from
+behind when the sun is ahead of the camera, the background's colors wrapping
+over its edges, fill from the dome above and the ground below. `sky.light`
+hands those over as plain numbers for another renderer to light with.
+
+```ts
+const sky = new Atmosphere(canvas, {
+  lightProbe: true,                       // measure the sky ~10×/s
+  onLight: (light) => { /* push into your renderer */ },
+});
+
+const light = sky.light;                  // or read it whenever you draw
+```
+
+It comes in two halves, because they come from different places:
+
+**The lights** — `light.sun`, `light.moon`, and `light.key` (whichever is
+lighting the scene more, or `null`). Computed from the state with the shader's
+own formulas: exact, free, and tracking the camera every frame, probe or no
+probe.
+
+| field | what it is |
+|:---|:---|
+| `direction` | unit vector toward it, world axes (x east, y up, z north) |
+| `view` | the same in the camera's frame (x right, y up, z into the screen). **`view[2] > 0` is backlight** — it is behind the subject — and `(view[0], view[1])` is which way on screen the rim faces |
+| `screen` | `{ x, y, inFront }`, 0..1 from the top-left; outside 0..1 when out of frame |
+| `color` | linear RGB, brightest channel 1 — white at noon, orange at sunset |
+| `visibility` | 0..1 how much gets through: horizon and cloud cover |
+| `intensity` | `visibility` on one scale for both, a clear sun = 1 (the moon tops out at `MOON_RELATIVE`) |
+
+**The measurement** — `light.frame` and `light.environment`, from drawing the
+real shader into a tiny offscreen buffer and reading it back, so clouds, haze,
+the filter and the tone curve are all in it. `null` until the first
+measurement, and always with `lightProbe` off.
+
+| field | what it is | use it for |
+|:---|:---|:---|
+| `frame.average` | the whole frame | overall exposure / tint of the foreground |
+| `frame.grid` | the frame as `cols × rows` cells (default 8×6), top-left first | **light wrap**: `sampleLightGrid(grid, x, y)` at the subject's edges |
+| `environment.sky` / `.ground` | the dome above / below the horizon | a hemisphere light's two colors |
+| `environment.zenith` / `.horizon` | above 60° / 0–15° up | top light / grazing light |
+| `environment.directions` | `east west up down north south` | an ambient cube: `sampleEnvironment(env, normal)` |
+
+Every color is a `LightSample`: `srgb` (0..1, for CSS or a 2D canvas),
+`linear` (for a lighting equation), and `luminance`. Averages are taken in
+linear light and weighted by solid angle. The frame is measured as displayed,
+lens effects included — light wrap wants what is actually behind the subject —
+while the environment leaves the flare and vignette out.
+
+Hooking it to three.js, for example:
+
+```ts
+const hemi = new THREE.HemisphereLight();
+const rim = new THREE.DirectionalLight();
+
+const sky = new Atmosphere(canvas, {
+  lightProbe: true,
+  onLight: (light) => {
+    if (light.environment) {
+      hemi.color.setRGB(...light.environment.sky.linear);
+      hemi.groundColor.setRGB(...light.environment.ground.linear);
+    }
+    const key = light.key ? light[light.key] : null;
+    rim.intensity = key ? key.intensity * 3 : 0;
+    if (key) {
+      rim.color.setRGB(...key.color);
+      rim.position.set(...key.direction);   // same right-handed, y-up axes
+    }
+  },
+});
+
+// keep the two cameras pointing the same way: yaw 0 faces +z
+const d = threeCamera.getWorldDirection(new THREE.Vector3());
+sky.set({ camera: { yaw: Math.atan2(d.x, d.z), pitch: Math.asin(d.y), fov: THREE.MathUtils.degToRad(threeCamera.fov) } });
+```
+
+The weather controller's **Foreground light** panel draws a figure lit from
+nothing but these numbers (`examples/controller/figure.ts`), fill, wrap and
+rim — a working reference for a 2D compositor.
+
+**Cost.** A measurement is a few thousand pixels of drawing, which is nothing,
+plus a GPU readback, which is not: `readPixels` waits for the GPU. About 1 ms
+of main-thread wait on an M2 Max; 3–5 ms on a Radeon 780M through ANGLE's
+Direct3D backend, nearly all of it the round trip to a GPU that went idle
+after the last frame (back to back, the same measurement takes 0.5 ms). So it
+runs at `rate` (default 10/s), before the frame's own draw so it waits only on
+itself, and eases each result in over `smoothing` seconds (default 0.3) — a few
+dozen point samples of a moving sky shimmer otherwise. Lower `rate` where a
+stall of that size matters, and on a canvas that is not being presented (hidden,
+or drawn but never composited): the readback then also waits for every frame
+queued since the last one. `smoothing: 0` passes lightning through at full
+strength.
+`sky.measureLight()` takes one right now, unsmoothed, probe option or not;
+`AtmosphereRenderer.probe()` is the same thing for a custom loop.
+
+## Crepuscular rays
+
+Shafts of sunlit air fanning out from the sun through the gaps in a cloud
+deck. The split's cloud stack holds the deck's transmittance pixel by pixel,
+so a march along the line toward the sun's place on screen, summing what gets
+through, is how much sunlit air stands between a pixel and the sun — the
+shadow-volume integral, in screen space. That is why they live in the split
+variant: `rays` needs `cloudScale` given (1 is fine), and with them on a
+cloudy frame always takes the split's two passes.
+
+```ts
+const sky = new Atmosphere(canvas, { cloudScale: 1, rays: 1, time: 17, weather: 'fair' });
+sky.rays = 0.5;   // changeable at run time
+```
+
+Best with a low sun behind broken cloud, on screen or just off its edge; a
+clear sky shows only a soft glow around the sun, and a full deck nothing.
+
+## Large canvases — 1080p, 2160p
+
+The sky's cost is per pixel: the same scene at 2160p costs about 3.2× what it
+does at 1080p. Measured on an M2 Max with GPU timer queries, sweeping the time
+of day from dawn to dusk at `resolutionScale: 1`:
+
+| | 1080p | 2160p |
+|:---|---:|---:|
+| partly cloudy | 5.3 ms | 17.1 ms |
+| summer (cumulus + a thunderhead) | 5.6 ms | 18.1 ms |
+
+Over a whole day the cost moves by about ±10% and never spikes — the time of day
+is not what makes an animation unsteady. What does is a frame that sits right at
+the display's deadline: 2160p at 60 fps needs 16.7 ms, gets 17–19, and so some
+frames make it and some do not, and the motion judders between 16 and 33 ms.
+Three ways out, from no change at all to the most effective:
+
+```ts
+// 1. a steady 30 fps instead of an unsteady 60 — no other change
+new Atmosphere(canvas, { resolutionScale: 1, fps: 30 });
+
+// 2. clouds at half resolution: the frame roughly halves
+new Atmosphere(canvas, { resolutionScale: 1, fps: 60, cloudScale: 0.5 });
+
+// 3. hold every frame under a budget by lowering the resolution only when needed
+new Atmosphere(canvas, { resolutionScale: 1, fps: 60, adaptiveResolution: true });
+```
+
+**`quality`** sets the clouds' resolution and how the towers are drawn
+together, for when you'd rather pick a level than tune two settings:
+
+| preset | `cloudScale` | `cumulonimbus` | a cloudy frame |
+|---|---|---|---|
+| `'high'` | 1 | `'auto'` | the default picture |
+| `'balanced'` | 0.75 | `'auto'` | about 0.8 of the time, cloud edges a little softer |
+| `'low'` | 0.5 | `'2d'` | about half, a towering one less |
+
+```ts
+const sky = new Atmosphere(canvas, { quality: 'balanced' });
+sky.quality = 'low';   // switch at run time; sky.quality reads it back
+```
+
+Either setting given as well wins for that setting
+(`{ quality: 'low', cumulonimbus: 'auto' }` keeps the volumetric tower).
+
+**`cloudScale`** draws the cloud stack — three quarters or more of a cloudy
+frame — at that fraction of the resolution, each way, and lays it over a sky
+drawn at full resolution; the sun, moon, stars, rain, snow, lens and ground keep
+theirs. Against the one-pass renderer: 0.5 takes 0.49–0.62 of the time, 0.75
+takes 0.81–0.89 (2160p summer: 11.3 → 5.5 ms). The cost is softer cloud edges,
+and the 22° halo is laid under the whole stack rather than between the
+cirrostratus and the layers above it. A frame with no clouds at all is drawn
+in one pass whatever the setting, since splitting nothing out would only add
+work. Needs half-float render targets; without them it draws in one pass.
+Giving the option at all — 1 included — is what makes `sky.cloudScale`
+settable later. At 1 the frame is drawn with the one-pass shader, as without
+the option; the variant that splits is compiled the first time the scale goes
+under 1, the frame drawn whole in the meantime.
+
+**`skyCache`** (experimental, off by default) draws the cloud stack into
+keyframes over directions — azimuth × elevation — and reads each frame's
+clouds back from them, instead of drawing them per pixel. The stack depends on
+the direction and the state, not the camera, so turning the camera costs it
+nothing. The clouds' drift and evolution are followed by a keyframe every 15
+frames' worth of their own clock (`frames`) — oftener where the clock runs
+fast for the frame rate, at 30 fps or in a strong wind, down to every 4
+(`windRun`, `evoRun`) — each built whole over the frames before it is shown,
+for the clock it is shown at. A frame shows the two either side of its own
+clock, each moved to the frame's moment before they are mixed — along the
+drift every layer is known to have, and along the reshaping found between the
+two (a tower's flank climbing, a cumulus crumbling) — so a cloud moves on
+continuously rather than sitting still and dissolving into its next place, and
+uneven frame times move it no differently from even ones. On an M2 Max at
+1080p and 60 fps a cloudy frame takes 0.16–0.24 of the time (summer 14.0 →
+2.7 ms), still or panning; a light sky, or a strong wind's oftener keyframes,
+0.3–0.5; a sky of nothing but a little thin ice cloud, cheap to draw anyway,
+0.8. What it cannot
+follow still dissolves, less than it did: a faint fast layer over a slower one
+(the scud over a high sheet), and what appears from nothing.
+
+A `set()` goes through the cache like any other frame: keyframes go on being
+built, each for the state it will be shown in, and the mix between two of them
+is the change as it goes (fair to summer at 1080p: 2.5 ms a frame all through
+it, against 11.5 drawn directly). The clouds start to change a third of a second
+after the sky does, the keyframes already made being for the sky as it was, and
+catch up over the next quarter second; from there the picture is as close to
+the direct one as it is at rest. With no keyframes to show — the frames after the first,
+a `jump()`, a view that turned out of its window — the clouds come from a soft
+map, a sixth of a keyframe's texels, drawn whole in one frame for less than a
+direct frame costs, and it hands over to the keyframes by the same mix as they
+come whole: half a second after a start the sky has sharpened, with no step in
+it. The very first frame, a still sky, a clear sky, the `'auto'` tower's
+crossfade band and a view that wants more texels than `budget` are drawn
+directly.
+
+The picture is not quite the direct one. At the default density the finest
+grain is softer, most in a wide view's lower corners and along a tower's hard
+edges (a cumulus sky's fine detail, by its Laplacian energy, at 0.65–0.72 of the
+direct picture's; a close view 0.84; overcast and thin high cloud 0.87–0.99).
+Parhelia and dusk gradients come through untouched. `density: 0.5` is a quarter
+of the memory but plainly another picture: a tower's small lobes melt and the
+streaks low in the sky turn to blobs (0.26–0.37). 1.25 reaches 0.77–0.80 at 1.6
+times the memory. As under `cloudScale`, the 22° halo lies under all the
+clouds.
+
+It holds three half-float maps, each with a map of its motion beside it, and
+the soft map: 115–285 MB at 1080p (the default `'view'` window round the
+camera), 270–650 MB for `region: 'panorama'`; `motion: false` mixes
+the keyframes as they stand, a crossfade plain to see, at half that. Without
+half-float targets, without `WEBGL_draw_buffers` (unless `motion: false` asked
+to do without it) or without the memory, every frame is drawn directly, and
+`sky.skyCache` reads false.
+
+```ts
+new Atmosphere(canvas, { skyCache: true });
+new Atmosphere(canvas, { skyCache: { region: 'panorama', frames: 30 } });
+```
+
+**`adaptiveResolution`** measures each frame's GPU time and lowers the
+resolution when a frame would overrun its budget — by default three quarters of
+the frame interval — and raises it again a step at a time when there is room.
+Down is immediate; up is a probe that backs off if it fails, which keeps a GPU
+that clocks down at lighter loads from making the canvas bounce. Under budget
+it never acts. On 2160p summer at 60 fps it settled at 0.78 (3000×1688,
+12.2 ms) and held; with `cloudScale: 0.5` it stayed at full size. `budget` and
+`min` tune it; `sky.resolution` reads the current factor. Needs
+`EXT_disjoint_timer_query` (Chrome and Edge on the desktop); elsewhere the
+resolution holds.
+
+On Windows and integrated GPUs, turn one of these on for anything near 2160p: a
+towering sky is the heaviest case, and at the default quality it overruns a 60 fps
+budget even on a Radeon 8060S (ANGLE / Direct3D 11, 2160p summer: 16.1 ms; 11.7 ms
+at `cloudScale: 0.75`, 4.2 ms at `quality: 'low'`). None of them is on by default,
+since each changes the picture when it acts.
+
+## Display P3
+
+Rendered in Display P3 where the browser supports it, sRGB otherwise. No setup
+needed — `colorSpace` defaults to `'auto'`.
+
+```ts
+const sky = new Atmosphere(canvas, { colorSpace: 'srgb' });   // opt out
+sky.colorSpace;   // 'display-p3' or 'srgb' — what's actually in use
+```
+
+The conversion is appearance-preserving: the palette is untouched, and the sky
+looks the same on either display. What it buys is narrow but real — highlights
+that run past 1.0 (the sun's core, a lightning flash) clip later in P3, so a
+little more of the blowout survives.
+
+It does **not** currently reach outside sRGB, and that's a property of the
+palette, not an oversight. sRGB and Display P3 share the same blue primary, so
+P3's extra room is entirely in red and green — and a sky is blue-dominated. The
+one warm color, magic hour's amber, composites down to a desaturated salmon that
+sits well inside sRGB. Measured with a two-space readback diff, deliberately
+widening the light sources moves them under 1.5% past sRGB, and magic hour never
+leaves sRGB at all. Getting a visible wide-gamut sky means re-tuning the ~60
+color literals against P3 primaries; the machinery for that is in place
+(`GAMUT_REACH` in `src/shaders/sky.ts`), unused.
+
+Baking wide-gamut faces needs the receiving 2D canvas to agree, or the copy
+clips back to sRGB. `renderCubeFaces` handles this; a hand-rolled loop should
+pass `renderer.colorSpace` through:
+
+```ts
+canvas.getContext('2d', { colorSpace: renderer.colorSpace }).drawImage(source, 0, 0);
+```
+
+## Reduced motion
+
+A full-screen background in constant motion is hard on users with vestibular
+disorders, so `prefers-reduced-motion: reduce` is honored by default: `start()`
+draws a single still frame instead of looping, and `set()` applies the change as
+a cut with no transition. Changes to the media query are followed live, so the
+loop stops and resumes as the OS setting is flipped.
+
+```ts
+const sky = new Atmosphere(canvas, { respectReducedMotion: false });  // keep animating regardless
+sky.reducedMotion;   // true while the sky is being held still
+```
+
+A canvas scrolled out of the viewport or under `display: none` is not drawn,
+though its clocks, transitions and light probe go on, so it comes back as if it
+had been drawn all along. If something reads the canvas from out of view (a
+texture for another renderer, `captureStream()`), keep it drawing:
+
+```ts
+const sky = new Atmosphere(canvas, { pauseOffscreen: false });
+```
+
+## API
+
+| export | role |
+|:---|:---|
+| `Atmosphere` | canvas + renderer + render loop. `set()` / `jump()` / `start()` / `stop()` / `dispose()` / `whenSettled()` |
+| `AtmosphereRenderer` | one `render()` call draws one frame. For custom loops or offscreen rendering |
+| `StateAnimator` | following a target, and integrating wind / shape evolution. No DOM dependency |
+| `resolveConditions(c)` | `Conditions` → `AtmosphereState` |
+| `resolveWeather(w)` | observation / preset → 0..1 parameters |
+| `resolveClouds(c)` / `defaultCloudMix(...)` | resolving cloud genera, and auto-expanding from cloud cover |
+| `CLOUD_GENERA` | metadata for the ten genera (name, nickname, altitude, form) |
+| `resolveFilter(f)` | resolving a filter specification |
+| `solarPosition(date, loc)` | solar azimuth/elevation from latitude/longitude and datetime |
+| `lunarPosition(date, loc)` | the moon's azimuth/elevation and lit fraction, likewise |
+| `WEATHER_PRESETS` / `FILTER_PRESETS` | presets |
+| `DEFAULT_CAMERA` / `CUBE_FACE_CAMERAS` | cameras |
+| `renderCubeFaces(c, opts)` | bake the 6 skybox faces in one call, as 2D canvases |
+| `resolveCelestial(c)` | resolving a night-sky specification |
+| `resolveTone(t)` / `resolvePolarizer(p)` | resolving a tone curve / polarizer specification |
+| `resolveLens(l)` | resolving a lens specification |
+| `resolveParticles(p)` | resolving a falling-particle specification |
+| `resolveGround(g)` | resolving a ground specification (the sea) |
+| `resolveSunset(s)` | resolving a sunset specification (warmth, glow) |
+| `resolveSun(s)` | resolving the sun's disc size and glare |
+| `celestialLights(s, cam, aspect)` | the sun and moon as directional lights, without a probe |
+| `ResolutionGovernor` | the adaptive resolution's control loop, for a custom render loop (feed it `renderer.takeGpuTimes()` with `timing: true`) |
+| `sampleLightGrid(g, x, y)` / `sampleEnvironment(env, n)` | reading a light measurement at a screen point / for a surface normal |
+| `srgbToDisplayP3(c)` / `displayP3ToSrgb(c)` | convert an encoded color between the two spaces |
+| `formatTod(tod)` | `14.5` → `"14:30"` |
+| `weatherLabel(id, locale)` / `filterLabel(id, locale)` / `cloudGenusLabel(id, locale)` | localized labels (`'en'` / `'ja'`) |
+
+To integrate with your own render loop instead of using `Atmosphere`:
+
+```ts
+const renderer = new AtmosphereRenderer(canvas);   // renderer.available === false if WebGL isn't supported
+const anim = new StateAnimator(resolveConditions({ time: 14, weather: 'summer' }));
+
+let last = performance.now();
+function frame(now: number) {
+  const dt = Math.min(0.2, (now - last) / 1000); last = now;
+  anim.step(resolveConditions({ time: 23, weather: 'typhoon' }), dt);   // pass the target every frame
+  renderer.render(now / 1000, anim.current, DEFAULT_CAMERA, anim.wind, anim.evolution);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+```
+
+## Waiting for the shader
+
+The shader is compiled off the main thread, so nothing is drawn for the first
+moment of a page's life. `render()` is a no-op until then, `ready` says whether
+it has happened, and `onReady` fires when it does — with `false` if the device
+could not compile the shader at all, which is the signal to keep your fallback
+background for good. Where a sky with a cumulonimbus in it would keep the canvas
+empty for long (a first visit on Windows, see below), that first frame is the sky
+without the tower, which fades in when its own program lands.
+
+```tsx
+const [ready, setReady] = useState(false);
+useEffect(() => {
+  const sky = new Atmosphere(canvasRef.current!, { weather: 'summer', onReady: setReady });
+  return () => sky.dispose();
+}, []);
+// <canvas style={{ opacity: ready ? 1 : 0, transition: 'opacity 600ms' }} />
+```
+
+How long that takes is mostly a browser and driver question. On Windows, WebGL
+runs through ANGLE's Direct3D backend, whose compiler inlines and unrolls a
+shader this size into something very large; a first visit costs a few seconds
+there, and near nothing on macOS. A sky with a cumulonimbus in it takes tens of
+seconds, though the rest of that sky appears within a few. Every visit after
+that is instant on any platform — browsers keep compiled shaders in an on-disk
+cache.
+
+Pass `compile: 'sync'` to `AtmosphereRenderer` to block until the program is
+linked instead. That is what `renderCubeFaces` does, because a bake has no
+loop to come back on; do not do it for anything on screen.
+
+The shader is compiled per combination of features a sky needs — the sea,
+the aurora, the halos, the rainbow, the rain shafts and the rest are each compiled in only
+when their state is on, because a block that is never run still costs every
+frame by being there. The light from behind — the backlit and side-lit
+shading of the towers and the cumulus — is left out of a view turned away
+from the sun as well, where none of it can show: a frame of towers seen with
+the sun behind or beside you is about a tenth lighter for it. The parhelia
+have a program of their own that redraws only the small rectangles they can
+fall in, over the frame drawn without them, so a sky with them costs a few
+percent with a parhelion in view and nothing otherwise, and isn't compiled at all
+while the plates that make them aren't settled, which is most of the time. A feature coming on later gets its variant compiled
+then, in the background; the frames in between are drawn with the previous
+variant, so the feature appears a fraction of a second after it is asked for
+rather than the picture blanking. `set()` starts that compile ahead of the
+transition. Pass `variants: false` to compile everything into one program
+instead; `examples/bench/` measures the two against each other.
+
+`ready` turns true as soon as anything can draw, a stand-in included. To know
+when the sky is drawn by its own variants, with every feature it was asked for
+— before baking a cubemap from it, or taking a screenshot — there is
+`settled`, `onSettled` and `whenSettled()`:
+
+```ts
+const sky = new Atmosphere(canvas, { weather: 'fair', onSettled: (ok) => ok && bake() });
+sky.set({ ground: 'sea' });            // the sea's variant: sky.settled is false until it links
+if (await sky.whenSettled()) bake();   // true once it has linked and been drawn
+```
+
+`settled` goes false on a `set()` or `jump()` that needs a variant not yet
+linked, and true again once it has linked and a frame has been drawn with it
+(with no loop running — a still frame, `autoStart: false` — as soon as it
+links). `onSettled` fires on each turn to true; a `set()` that needs nothing new
+fires nothing. Where the sky can never draw — no WebGL, or a shader that would
+not compile — `onSettled(false)` fires along with `onReady(false)`, and
+`whenSettled()` resolves `false`, as it does for a sky disposed while waiting.
+It costs a frame nothing to speak of: a look over the variants in hand. Driving
+`AtmosphereRenderer` yourself, `renderer.isSettled(state)` answers the same
+after `renderer.prepare(state)`; under `compile: 'sync'` it is always true.
+
+## Internationalization
+
+The core's `label`/`alias` fields (`CLOUD_GENERA`, `WEATHER_PRESETS`,
+`FILTER_PRESETS`) are English. Japanese labels are available through
+`weatherLabel(id, 'ja')` / `filterLabel(id, 'ja')` / `cloudGenusLabel(id, 'ja')`
+(`src/i18n.ts`).
+
+```ts
+import { weatherLabel, cloudGenusLabel } from '@takustaqu/atmosphere';
+
+weatherLabel('typhoon', 'ja');           // '台風'
+cloudGenusLabel('cumulonimbus', 'ja');   // { label: '積乱雲', alias: '入道雲' }
+```
+
+`examples/react/AtmosphereControls` switches between them via a `locale` prop (default `'en'`).
+
+## Examples
+
+`examples/` is usage examples for the renderer — it isn't part of atmosphere itself.
+If you don't like how one looks, copying it and rewriting it is the fastest path.
+
+### React
+
+```tsx
+import { AtmosphereCanvas } from '@takustaqu/atmosphere/react';
+import '@takustaqu/atmosphere/react/styles.css';
+
+<AtmosphereCanvas time={new Date()} weather="rain" filter="sepia" />
+```
+
+A settings panel for manual testing, `AtmosphereControls`, ships alongside it.
+
+### Weather controller
+
+```bash
+pnpm playground   # → http://localhost:8791/examples/controller/
+```
+
+A sample for driving every parameter by hand. **Drag the canvas to look around; scroll to change the field of view.**
+Because drawing is ray-basis, this isn't a flat background — it's the same as
+looking around the inside of a skybox draped over the scene. Press "Bake 6 faces"
+and that same sky gets baked into a cubemap on the spot.
+
+The "Sky phenomena" drawer has buttons for a rainbow, the 22° halo, parhelia and the
+aurora. Each only shows under the right conditions and in the right direction
+(a rainbow needs rain falling while the sun is out and lower than 42°, and
+stands opposite the sun), so each sets the weather it needs and turns the
+camera to it.
+
+It also shows how the observation values resolved into the renderer's 0..1
+parameters at all times, so you can see exactly what `cloudCover` or
+`visibility` actually does as you move the sliders.
+
+### Playground
+
+```bash
+pnpm playground   # → http://localhost:8791/examples/playground/
+```
+
+A contact sheet of conditions laid out side by side. Switch which axis is laid
+out with `?sheet=time | weather | genus | sparse | tower | filter | location | camera`;
+`?sheet=grow` is an animated demo (a cumulonimbus grows, spreads an anvil, and
+collapses over 40 seconds); `?sheet=nimbostratus | altostratus | cumulonimbus`
+are benchmarks meant to be compared against real photos. This is the fastest
+way to check for regressions after changing the look of something.
+
+## Design notes
+
+- **Hold the sun as a direction, and resolve everything in ray-basis.** The
+  sun is handled as azimuth/elevation. That lets a real solar position from
+  latitude/longitude be passed straight through, and lets the camera face any
+  direction without breaking. Sky color is also a function of elevation along
+  the view ray, so there's no need to assume "top of screen = zenith".
+- **Advance wind and shape evolution by integration.** Computing position as
+  "elapsed time × wind speed" makes the offset jump the instant the weather
+  changes the speed, warping the clouds. Integrating `position += speed × dt`
+  every frame keeps the offset continuous even as speed changes. Clouds only
+  drift when time of day moves; a weather-only change mutates clouds in place.
+- **Decompose severe weather into rain, snow, wind, and thunder.** Keeping
+  them independent draws windless heavy rain, or a rainless gale. Overall sky
+  darkness and cloud turbulence are derived from these.
+- **Reduce the ten cloud genera to "4 forms × 3 altitudes".** What actually
+  differs is one of four forms — filament, stratiform, granular, convective —
+  and altitude (the cloud plane's projection scale).
+- **Resolve the cumulonimbus silhouette as a 2D field with a single formula.**
+  A 1D height profile — pick one height per azimuth and fill below it — can
+  only ever produce a triangular hill. Making it a 2D field over azimuth and
+  elevation, and cutting the threshold with a "thrust − height" formula, lets
+  it taper naturally toward a round top. Sharpening the azimuthal profile lets
+  a tower narrow upward while keeping its height.
+- **Build round lobes from summed spheres, then layer high-frequency detail
+  separately.** Thresholding noise always produces a fractal boundary at every
+  scale, never a round lobe. Summed, jittered spheres give boundaries made of
+  circular arcs instead. But a sum of spheres has no high-frequency content,
+  so fine detail needs its own noise layered on top. Use at least 3 scales.
+  Thin, flat companion forms (anvil, velum) should be built as a lobe field
+  flattened vertically, not as an elevation band — a band is structurally a
+  line no matter how frayed its edge gets.
+- **Keep the shading signal unsaturated; build contrast in the color mapping.**
+  Raising the gain and clamping to ±1 collapses surface orientation to two
+  values, and the color built from it to two colors. Keep the signal
+  continuous and small, and walk it across dark/mid/bright through a wide
+  `smoothstep`. Pushing contrast toward photographic realism tends to look
+  like a pasted-on cutout — for a background, favor the weaker choice when unsure.
+- **Precipitation reads as lost visibility, not as particles.** Drawing only
+  particles reads as "white dots floating in a clear sky". Particle size and
+  spacing need to vary continuously with depth, or it reads as artificial.
+  Skip cloud genera with amount 0 entirely, and default to a light footprint
+  (30fps, ~0.55× resolution).
+- **Bake the value-noise lattice into a texture, and fetch it at an explicit
+  LOD.** Every cloud here bottoms out in `fbm`, and `fbm` used to bottom out in
+  twenty hash evaluations, inlined at every one of several dozen call sites.
+  That is cheap to run and ruinous to compile: Windows hands the shader to
+  Direct3D through ANGLE, which inlines and unrolls all of it. Reading the
+  lattice from a small tiling texture and letting the sampler's own bilinear
+  filter do the interpolation is the same arithmetic in one instruction. But
+  ask for it with a plain `texture2D` and it gets *slower*: a fragment-shader
+  fetch carries an implicit derivative, a derivative may not sit in non-uniform
+  control flow, and the compiler resolves that by flattening — every "skip this
+  genus" branch stops skipping. Naming the mip level asks for no derivative and
+  the branches come back.
+
+## Cumulonimbus companion forms
+
+Anvil and veil clouds aren't among the ten genera — they're forms attached to
+cumulonimbus, so they live in `features`. Omit it and they're derived
+automatically from `cumulonimbus`'s development (veil accompanies a growing
+tower; it fades once it matures and the anvil spreads).
+
+```ts
+sky.set({ weather: {
+  clouds: { cumulonimbus: 0.9 },
+  features: { anvil: 1, velum: 0.3 },   // explicit
+}});
+```
+
+`altocumulus` past about 0.72 runs together into a sheet: thick in places, a plain
+grey mass, and thin in others, where its cells and the waves that line them up in
+rows show and a low sun comes through pale, over a strip of clear lit air along the
+horizon. `features.lenticular` (0..1, 0 unless asked for) lays long dark lens-shaped
+banks low over the horizon. The `dappled` weather is the two together.
+
+`features.distance` (0..1, default 0.65) is how far off the storm stands. At 0
+its base looms overhead, the tower fills the sky and the anvil spreads right
+above you, mammatus and all; at 1 it is a small storm on the horizon with its
+foot sunk in haze. The towers, the skirt, the base's elevation, the anvil's
+apparent size and where the rain shafts start all scale together.
+
+```ts
+sky.set({ weather: { cloudCover: 0.3, convection: 0.9, features: { distance: 0.2 } } });  // a storm close by
+```
+
+By default (`cumulonimbus: 'auto'`) the tower is ray-marched through a 3D
+density — the same turrets, standing in real depth with the 2D tower's
+skyline, lobes in two scales of surface, and the 2D tower's florets laid on
+its light and fraying its outline, lit by taps toward the sun and the sky —
+except for a storm close by, its base looming overhead (`features.distance`
+under about 0.45), where the march's coarse lobes stand a few hundred pixels
+across and come out as smooth slabs, and the 2D tower, a field over azimuth
+and elevation with its lobes and shading painted on, is drawn instead. As a
+storm draws nearer or recedes across 0.42–0.52 the two are crossfaded, so
+neither pops in. A frame with the volumetric tower costs about 1.10–1.19×
+what it does with the 2D one at 1080p (an M2 Max; pair it with
+`cloudScale: 0.5` where that matters), a near storm costs what the 2D tower
+does, and a frame inside the crossfade draws both towers, about twice the
+2D tower's frame (the sky outside the towers is drawn once) — only while the
+distance passes through. As the storm drifts, the volumetric outline and
+the edges between turrets change about 1.2–1.4× as many pixels a frame as
+the 2D tower's at 640×400, and some three times as many at 1280×800.
+
+`features.softness` (0..1, default 0.6) is how soft the volumetric tower's
+surface is. At 0 it is the cauliflower: crisp lobes and florets, each rim a
+clean outline, the folds shaded hard. Toward 1 it moves toward cotton candy:
+the surface becomes a fuzzy shell the sky shows a little through at the
+outline, frayed in fine tufts, with the light wrapping round the lobes and
+filling the folds. The 2D tower ignores it.
+
+```ts
+sky.set({ weather: { convection: 0.9, features: { softness: 1 } } });  // fluffier
+```
+
+`'2d'` draws the 2D tower at every distance — the lighter option — and
+`'volumetric'` the volumetric one at every distance. Each tower is a shader
+variant of its own, so a frame carries only the code it draws; the anvil,
+veil and rain shafts are 2D whichever, and a sky with no tower carries none
+of it.
+
+```ts
+const sky = new Atmosphere(canvas, { cumulonimbus: '2d' });   // the lighter tower everywhere
+sky.cumulonimbus = 'auto';   // switch at any time
+```
+
+The cumulonimbus itself stands as a cluster of turrets competing in height,
+a full-bodied mass with a broad rounded crown. Each lobe is shaded as a sunlit
+dome — light on the crowns, shadow in the creases between — on a flat dark
+base, with a skirt of towering cumulus at its foot. Every tower lives a life
+on its own clock: it climbs as congestus, spreads its anvil on reaching the
+tropopause, then sinks and leaves the anvil behind as a thin fibrous sheet
+that fades — so a sky holds towers at different stages at once.
+
+These two are built fundamentally differently. Anvil is **ice crystal**, so it
+has no cauliflower texture — it becomes silky horizontal streaks that spread
+far downwind. Veil is **water droplet**, so it has no fibers — it drapes as a
+single, smooth white sheet over the tower's flank.
+
+## Not implemented
+
+- Other variants (fallstreak holes, mammatus, pileus, etc.)
+- A physical atmospheric-scattering model (colors are hand-tuned, not Rayleigh/Mie)
+- A path for temperature, humidity, and pressure themselves (visibility and cloud cover stand in for now)
+
+## Distribution
+
+The npm package ships **built ESM bundles with type declarations**
+(`exports` points at `dist/`), with no dependencies — no bundler required.
+The TypeScript source rides along in `src/` for reference; in the
+repository, `pnpm typecheck` checks it and `pnpm build` produces `dist/`.
+
+Release history lives in [CHANGELOG.md](CHANGELOG.md).
+
+## License
+
+MIT License.
+ See [LICENSE](LICENSE).

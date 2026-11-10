@@ -1,0 +1,832 @@
+// Weather controller — a sample for driving every atmosphere parameter by hand
+//
+//   pnpm playground  → http://localhost:8791/examples/controller/
+//
+// Drag the canvas to look around; scroll to change the field of view.
+// Drawing is ray-basis, so sky, clouds, sun, moon and stars are all resolved
+// as "what's visible in that direction". That means this isn't a flat
+// background — it's the same as looking around the inside of a skybox
+// draped over the scene. "Bake 6 faces" bakes that same sky into a cubemap.
+
+import {
+  Atmosphere, AtmosphereRenderer,
+  CELESTIAL_IDS, CELESTIAL_PRESETS,
+  POLARIZER_IDS, POLARIZER_PRESETS, TONE_IDS, TONE_PRESETS,
+  CLOUD_GENERA, CLOUD_GENERA_IDS, CUBE_FACE_CAMERAS, DEFAULT_CB_DISTANCE, DEFAULT_CB_SOFTNESS,
+  FILTER_IDS, QUALITY_IDS, WEATHER_IDS, WEATHER_PRESETS,
+  cloudGenusLabel, filterLabel, weatherLabel,
+  formatTod, resolveClouds, resolveConditions,
+  type CloudMix, type Conditions,
+  type CelestialId, type FilterId, type PolarizerId, type ToneId, type GeoLocation, type Weather, type WeatherId,
+  type AtmosphereLight, type LightSample, type CumulonimbusMode, type QualityPreset,
+} from '../../src';
+import { Figure } from './figure';
+
+/** a ?cb= value or a chip's id as a tower mode: auto unless it names another */
+function cbParam(v: string | null): CumulonimbusMode {
+  return v === '2d' || v === 'volumetric' ? v : 'auto';
+}
+
+const canvas = document.getElementById('sky') as HTMLCanvasElement;
+const panel = document.getElementById('panel')!;
+
+// ── Values driven by hand ──────────────────────────────
+const CITIES: Record<string, GeoLocation | null> = {
+  'None': null,
+  'Wakkanai': { latitude: 45.42, longitude: 141.67 },
+  'Tokyo': { latitude: 35.68, longitude: 139.77 },
+  'Naha': { latitude: 26.21, longitude: 127.68 },
+  'Reykjavik': { latitude: 64.15, longitude: -21.94 },
+  'Sydney': { latitude: -33.87, longitude: 151.21 },
+};
+
+const ui = {
+  timeOfDay: 14,
+  dateISO: '2026-07-26',
+  city: 'None',
+  weather: {
+    cloudCover: 0.38,
+    precipitation: 0,
+    precipitationType: 'rain' as 'rain' | 'snow',
+    windSpeed: 3,
+    thunder: 0,
+    visibility: 25,
+    convection: 0.7,
+    icePlates: 0,
+  },
+  cloudMode: 'auto' as 'auto' | 'manual',
+  clouds: Object.fromEntries(CLOUD_GENERA_IDS.map((g) => [g, 0])) as CloudMix,
+  featureMode: 'auto' as 'auto' | 'manual',
+  features: { anvil: 0, velum: 0, lenticular: 0, distance: DEFAULT_CB_DISTANCE, softness: DEFAULT_CB_SOFTNESS },
+  filter: 'none' as FilterId,
+  tone: { ...TONE_PRESETS.neutral } as { exposure: number; contrast: number; knee: number; bleach: number },
+  polarizer: { ...POLARIZER_PRESETS.none } as {
+    strength: number; angle: number; saturation: number; stopLoss: number;
+  },
+  // starts on the default suburban sky, so the controller opens on exactly the
+  // sky it has always shown
+  celestial: { ...CELESTIAL_PRESETS.suburban } as {
+    bortle: number; milkyWay: number; meteors: number;
+    radiant: readonly [number, number] | null; aurora: number;
+  },
+  lens: { droplets: 1 },
+  particles: { precipitation: 1, contrails: 0 },
+  ground: { sea: 0, swell: 0.4 },
+  sunset: { warmth: 1, glow: 1 },
+};
+
+// the camera (for looking around). Defaults to a background-friendly, south-facing framing
+const cam = { yaw: Math.PI, pitch: 0.46, fov: 0.86 };
+
+const figureEl = document.getElementById('figure') as HTMLCanvasElement;
+const figure = new Figure(figureEl);
+// lightProbe measures the sky ten times a second; onLight hands each result over
+const sky = new Atmosphere(canvas, {
+  time: ui.timeOfDay, weather: ui.weather, camera: cam,
+  lightProbe: true,
+  // the sky is the content here, not interface motion, so it keeps moving
+  // under prefers-reduced-motion (Windows sets that whenever "Animation
+  // effects" is off)
+  respectReducedMotion: false,
+  // given at all, cloudScale is what lets the Performance panel switch it
+  // live (at 1 the one-pass shader draws; under it, the one that splits the
+  // clouds out, compiled the first time it is asked for)
+  cloudScale: 1,
+  // ?cb=2d or ?cb=volumetric opens on one tower at every distance rather
+  // than auto's (the chips under "Cumulonimbus companion forms" switch it
+  // live too)
+  cumulonimbus: cbParam(new URLSearchParams(location.search).get('cb')),
+  // ?cache=1 draws the cloud stack from the experimental sky cache
+  // (?cache=panorama for the whole round of the sky rather than the view's
+  // window; ?density=0.75 for its maps' texels per radian); it can only be
+  // chosen when the sky is made
+  skyCache: (() => {
+    const q = new URLSearchParams(location.search), v = q.get('cache');
+    if (v !== 'panorama' && v !== '1' && v !== 'view') return false;
+    const density = Number(q.get('density')) || undefined;
+    return { region: v === 'panorama' ? 'panorama' as const : 'view' as const, density };
+  })(),
+  adaptiveResolution: true,
+  onLight: (light) => {
+    // cam, not sky.camera: this can fire from inside the constructor (a still
+    // frame on a synchronous compile), before sky is assigned
+    if (figureEl.classList.contains('on')) figure.draw(light, cam, canvas);
+    showLight(light);
+  },
+});
+// expose for scripted QA, same as the playground's __skies (headless viewers
+// report visibility=hidden so rAF never fires; a script can jump() to draw)
+(globalThis as any).__sky = sky;
+
+/** the Conditions the UI state describes */
+function conditionsNow(): Conditions {
+  const loc = CITIES[ui.city];
+  return {
+    // only pass a Date when a location is set (computing the real solar position needs a date)
+    time: loc
+      ? `${ui.dateISO}T${formatTod(ui.timeOfDay).padStart(5, '0')}`
+      : ui.timeOfDay,
+    location: loc,
+    weather: {
+      ...ui.weather,
+      // leaving these undefined lets the cloud genus mix build automatically from cloud cover
+      clouds: ui.cloudMode === 'manual' ? ui.clouds : undefined,
+      // (the storm's distance and softness are not derived from anything,
+      // so they are passed either way; only the forms follow the development)
+      features: ui.featureMode === 'manual' ? ui.features
+        : { lenticular: ui.features.lenticular, distance: ui.features.distance, softness: ui.features.softness },
+    } as Weather,
+    filter: ui.filter,
+    celestial: ui.celestial,
+    tone: ui.tone,
+    polarizer: ui.polarizer,
+    lens: ui.lens,
+    particles: ui.particles,
+    ground: ui.ground,
+    sunset: ui.sunset,
+  };
+}
+
+/** build Conditions from the UI state and apply it */
+function apply(): void {
+  const conditions = conditionsNow();
+  sky.set(conditions);
+  readout(conditions);
+}
+
+// ── Looking around ─────────────────────────────────────
+// dragging feels like "grabbing the sky and pulling it". Scroll changes the field of view (zoom in to see cloud lobes)
+let dragging = false;
+let lastX = 0;
+let lastY = 0;
+
+canvas.addEventListener('pointerdown', (e) => {
+  dragging = true; lastX = e.clientX; lastY = e.clientY;
+  canvas.setPointerCapture(e.pointerId);
+  canvas.classList.add('dragging');
+});
+canvas.addEventListener('pointerup', (e) => {
+  dragging = false;
+  canvas.releasePointerCapture(e.pointerId);
+  canvas.classList.remove('dragging');
+});
+canvas.addEventListener('pointermove', (e) => {
+  if (!dragging) return;
+  // dividing by fov over the canvas height keeps the feel consistent at any zoom level
+  const k = cam.fov / canvas.clientHeight;
+  cam.yaw -= (e.clientX - lastX) * k * 1.6;
+  cam.pitch += (e.clientY - lastY) * k;
+  cam.pitch = Math.max(-1.35, Math.min(1.45, cam.pitch));
+  lastX = e.clientX; lastY = e.clientY;
+  sky.set({ camera: cam });
+  hud();
+});
+canvas.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  cam.fov = Math.max(0.22, Math.min(1.70, cam.fov * (1 + e.deltaY * 0.0012)));
+  sky.set({ camera: cam });
+  hud();
+}, { passive: false });
+
+const BEARINGS = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW'];
+
+function hud(): void {
+  const deg = ((cam.yaw * 180 / Math.PI) % 360 + 360) % 360;
+  document.getElementById('bearing')!.textContent =
+    `${BEARINGS[Math.round(deg / 45) % 8]} ${deg.toFixed(0)}°`;
+  document.getElementById('angles')!.textContent =
+    `elevation ${(cam.pitch * 180 / Math.PI).toFixed(0)}° / fov ${(cam.fov * 180 / Math.PI).toFixed(0)}°`;
+}
+
+// ── Panel building blocks ──────────────────────────────
+// Controls append to whichever drawer is currently open, not to the panel — so
+// section() switches the target and every slider() / chips() / note() after it
+// lands inside. The panel had grown past a screenful of flat rows.
+let host: HTMLElement = panel;
+
+function section(title: string, open = false): HTMLElement {
+  const box = document.createElement('details');
+  box.className = 'drawer';
+  if (open) box.open = true;
+  const head = document.createElement('summary');
+  head.textContent = title;
+  const body = document.createElement('div');
+  body.className = 'drawer-body';
+  box.append(head, body);
+  panel.append(box);
+  host = body;
+  return head;
+}
+
+function note(text: string): void {
+  const p = document.createElement('p');
+  p.className = 'note';
+  p.textContent = text;
+  host.append(p);
+}
+
+function slider(
+  label: string, min: number, max: number, step: number,
+  get: () => number, set: (v: number) => void, fmt: (v: number) => string,
+): () => void {
+  const row = document.createElement('div');
+  row.className = 'row';
+  const l = document.createElement('label');
+  l.textContent = label;
+  const input = document.createElement('input');
+  input.type = 'range';
+  input.min = String(min); input.max = String(max); input.step = String(step);
+  const out = document.createElement('output');
+  const sync = () => { input.value = String(get()); out.textContent = fmt(get()); };
+  input.addEventListener('input', () => { set(Number(input.value)); out.textContent = fmt(get()); apply(); });
+  row.append(l, input, out);
+  host.append(row);
+  sync();
+  return sync;
+}
+
+function chips(
+  items: { id: string; label: string }[],
+  isOn: (id: string) => boolean,
+  pick: (id: string) => void,
+): () => void {
+  const box = document.createElement('div');
+  box.className = 'chips';
+  const els = items.map((it) => {
+    const b = document.createElement('button');
+    b.className = 'chip';
+    b.textContent = it.label;
+    b.addEventListener('click', () => { pick(it.id); apply(); refreshAll(); });
+    box.append(b);
+    return { id: it.id, el: b };
+  });
+  host.append(box);
+  const sync = () => els.forEach(({ id, el }) => el.classList.toggle('on', isOn(id)));
+  sync();
+  return sync;
+}
+
+const syncers: (() => void)[] = [];
+const refreshAll = () => syncers.forEach((f) => f());
+
+// ── Assembling the panel ────────────────────────────────
+section('Presets', true);
+note('Swap a full set of observation values in at once, then dial it in with the sliders below.');
+syncers.push(chips(
+  WEATHER_IDS.map((id) => ({ id, label: weatherLabel(id) })),
+  () => false,
+  (id) => {
+    const p = WEATHER_PRESETS[id as WeatherId];
+    ui.weather = {
+      cloudCover: p.cloudCover ?? 0,
+      precipitation: p.precipitation ?? 0,
+      precipitationType: p.precipitationType ?? 'rain',
+      windSpeed: p.windSpeed ?? 0,
+      thunder: p.thunder ?? 0,
+      visibility: p.visibility ?? 30,
+      convection: p.convection ?? 0,
+      icePlates: 0,
+    };
+    // (a preset that names its clouds, rather than a cover to build them from)
+    if (p.clouds) {
+      ui.clouds = { ...ui.clouds, ...resolveClouds(p.clouds) };
+      ui.cloudMode = 'manual';
+    } else {
+      ui.cloudMode = 'auto';
+    }
+    ui.features.lenticular = p.features?.lenticular ?? 0;
+    ui.featureMode = 'auto';
+  },
+));
+
+section('Sky phenomena', true);
+note('Some of the sky only shows under the right conditions and in the right '
+  + 'direction. Each of these sets the weather it needs and turns the camera to it.');
+{
+  const DEG = Math.PI / 180;
+  const sunNow = () => resolveConditions(conditionsNow());
+  /** move the clock (without a location) to an hour whose sun suits the phenomenon */
+  const sunBetween = (lo: number, hi: number, hour: number) => {
+    const el = sunNow().sunElevation;
+    if (el < lo * DEG || el > hi * DEG) {
+      if (CITIES[ui.city]) ui.city = 'None';
+      ui.timeOfDay = hour;
+    }
+  };
+  const look = (yaw: number, pitch: number, fov: number) => {
+    cam.yaw = yaw; cam.pitch = pitch; cam.fov = fov;
+    sky.set({ camera: cam }); hud();
+  };
+  syncers.push(chips(
+    [
+      { id: 'rainbow', label: 'Rainbow' },
+      { id: 'halo', label: '22° halo' },
+      { id: 'parhelia', label: 'Parhelia' },
+      { id: 'moonhalo', label: 'Moon halo' },
+      { id: 'mooncloud', label: 'Moon behind clouds' },
+      { id: 'iridescence', label: 'Iridescence' },
+      { id: 'cza', label: 'Circumzenithal arc' },
+      { id: 'shafts', label: 'Rain shafts' },
+      { id: 'backlit', label: 'Backlit thunderhead' },
+      { id: 'aurora', label: 'Aurora' },
+      { id: 'away', label: 'Face away from the sun' },
+      { id: 'toward', label: 'Face the sun' },
+    ],
+    () => false,
+    (id) => {
+      // (only the Parhelia chip holds the plates settled, and it stays held
+      // until the weather is next changed by a chip or a preset)
+      if (id !== 'away' && id !== 'toward') ui.weather = { ...ui.weather, icePlates: 0 };
+      if (id === 'rainbow') {
+        // rain falling with the sun out behind you, lower than 42°
+        sunBetween(4, 38, 16.5);
+        ui.weather = { ...ui.weather, cloudCover: 0.3, precipitation: 4, precipitationType: 'rain',
+          thunder: 0, visibility: 25, convection: 0.2 };
+        ui.cloudMode = 'auto';
+        ui.particles.precipitation = 1;
+        look(sunNow().sunAzimuth + Math.PI, 0.32, 1.25);
+      } else if (id === 'halo') {
+        // a veil of cirrostratus with the sun in it
+        sunBetween(28, 60, 11);
+        ui.weather = { ...ui.weather, precipitation: 0, thunder: 0, visibility: 30 };
+        ui.cloudMode = 'manual';
+        ui.clouds = { ...ui.clouds, ...Object.fromEntries(CLOUD_GENERA_IDS.map((g) => [g, 0])),
+          cirrostratus: 0.75, cumulus: 0.08 };
+        const s = sunNow();
+        look(s.sunAzimuth, s.sunElevation, 1.3);
+      } else if (id === 'parhelia') {
+        // thin ice drifting across a low sun's level, with the sun and both
+        // parhelia in the frame. A thin veil under the cirrus, so there is ice at
+        // them whichever strands happen to be passing, and the plates held
+        // settled: left to itself most of the sky goes without
+        sunBetween(8, 25, 16.5);
+        ui.weather = { ...ui.weather, precipitation: 0, thunder: 0, visibility: 30, icePlates: 1 };
+        ui.cloudMode = 'manual';
+        ui.clouds = { ...ui.clouds, ...Object.fromEntries(CLOUD_GENERA_IDS.map((g) => [g, 0])),
+          cirrus: 0.55, cirrostratus: 0.2 };
+        const s = sunNow();
+        look(s.sunAzimuth + 0.2, s.sunElevation + 0.08, 1.2);
+      } else if (id === 'moonhalo') {
+        // a moonlit veil: night, the (nominal, full) moon high, cirrostratus
+        if (CITIES[ui.city] || sunNow().moonElevation < 30 * DEG) { ui.city = 'None'; ui.timeOfDay = 0.5; }
+        ui.weather = { ...ui.weather, precipitation: 0, thunder: 0, visibility: 30 };
+        ui.cloudMode = 'manual';
+        ui.clouds = { ...ui.clouds, ...Object.fromEntries(CLOUD_GENERA_IDS.map((g) => [g, 0])),
+          cirrostratus: 0.75 };
+        const s = sunNow();
+        look(s.moonAzimuth, s.moonElevation, 1.25);
+      } else if (id === 'mooncloud') {
+        // broken water cloud passing in front of a high moon: the cloud
+        // round it glows, colored by the corona
+        if (CITIES[ui.city] || sunNow().moonElevation < 30 * DEG) { ui.city = 'None'; ui.timeOfDay = 0.5; }
+        ui.weather = { ...ui.weather, precipitation: 0, thunder: 0, visibility: 30, windSpeed: 4 };
+        ui.cloudMode = 'manual';
+        ui.clouds = { ...ui.clouds, ...Object.fromEntries(CLOUD_GENERA_IDS.map((g) => [g, 0])),
+          altocumulus: 0.8, stratocumulus: 0.3 };
+        const s = sunNow();
+        look(s.moonAzimuth + 0.3, s.moonElevation - 0.15, 0.9);
+      } else if (id === 'iridescence') {
+        // thin water cloud drifting by a high sun: its edges take on pastel
+        // bands, from the same diffraction as the corona
+        sunBetween(35, 50, 10.5);
+        ui.weather = { ...ui.weather, precipitation: 0, thunder: 0, visibility: 30 };
+        ui.cloudMode = 'manual';
+        ui.clouds = { ...ui.clouds, ...Object.fromEntries(CLOUD_GENERA_IDS.map((g) => [g, 0])),
+          altocumulus: 0.45, cumulus: 0.1 };
+        const s = sunNow();
+        look(s.sunAzimuth, s.sunElevation, 0.9);
+      } else if (id === 'cza') {
+        // a cirrostratus veil with the sun near 22°: the arc stands high
+        // above it, round the zenith
+        sunBetween(16, 27, 16);
+        ui.weather = { ...ui.weather, precipitation: 0, thunder: 0, visibility: 30 };
+        ui.cloudMode = 'manual';
+        ui.clouds = { ...ui.clouds, ...Object.fromEntries(CLOUD_GENERA_IDS.map((g) => [g, 0])),
+          cirrostratus: 0.75 };
+        look(sunNow().sunAzimuth, 1.05, 1.2);
+      } else if (id === 'shafts') {
+        // a storm late in the day: curtains hang under the towers and the
+        // rain deck along most of the horizon, side-on to the sun so they
+        // take its light. The towers stand where the noise puts them, so
+        // turn the view along the horizon to find the deepest ones
+        sunBetween(4, 28, 17);
+        ui.weather = { ...ui.weather, cloudCover: 0.97, precipitation: 25, precipitationType: 'rain',
+          thunder: 1, windSpeed: 12, visibility: 5, convection: 0.5 };
+        ui.cloudMode = 'auto';
+        // the lens would be covered in drops in this rain, and they hide the view
+        ui.lens.droplets = 0;
+        look(sunNow().sunAzimuth + Math.PI / 2, 0.12, 1.3);
+      } else if (id === 'backlit') {
+        // a thunderhead standing against a low sun: dark mass, lit rim
+        sunBetween(2, 20, 17.6);
+        ui.weather = { ...ui.weather, cloudCover: 0.3, precipitation: 0, thunder: 0, visibility: 30, convection: 0.8 };
+        ui.cloudMode = 'auto';
+        look(sunNow().sunAzimuth, 0.25, 1.2);
+      } else if (id === 'aurora') {
+        // a dark night, looking north
+        if (sunNow().sunElevation > -18 * DEG) { ui.city = 'None'; ui.timeOfDay = 23; }
+        ui.weather = { ...ui.weather, cloudCover: 0, precipitation: 0, thunder: 0, visibility: 40 };
+        ui.cloudMode = 'auto';
+        ui.celestial = { ...CELESTIAL_PRESETS.aurora };
+        look(0, 0.3, 1.1);
+      } else {
+        const s = sunNow();
+        look(s.sunAzimuth + (id === 'away' ? Math.PI : 0), id === 'away' ? 0.32 : Math.max(0.1, s.sunElevation), cam.fov);
+      }
+    },
+  ));
+  note('Rainbow: rain falling while the sun is out and lower than 42°; the bow stands '
+    + '42° from the point straight away from the sun, so face away from it. '
+    + 'Halo: a cirrostratus veil, the ring 22° around the sun — or the moon, at night, '
+    + 'where the moonlit veil glows round it. Parhelia (sun dogs): wherever thin ice cloud, cirrus '
+    + 'or a veil, passes level with a sun below 45°, a small spot of spectrum either '
+    + 'side of it, red toward the sun, 22° out and further as it climbs; water cloud '
+    + 'hides them. They take plate crystals settled flat, so left to itself most icy sky '
+    + 'shows none, some a faint one, and only now and then a clear pair; this button '
+    + 'holds them settled. Moon behind clouds: a thin water cloud in '
+    + 'front of the moon glows, ringed by the corona. Iridescence: the thin edges of a '
+    + 'water cloud passing near the sun pick up pastel pinks and greens. Circumzenithal '
+    + 'arc: with the sun below 32° in a cirrostratus veil, an upside-down rainbow high '
+    + 'above it, red toward the sun. Aurora: a dark sky, toward the north.');
+}
+
+section('Time and location');
+syncers.push(slider('Time', 0, 24, 0.25,
+  () => ui.timeOfDay, (v) => { ui.timeOfDay = v; }, (v) => formatTod(v)));
+syncers.push(chips(
+  Object.keys(CITIES).map((k) => ({ id: k, label: k })),
+  (id) => ui.city === id,
+  (id) => { ui.city = id; },
+));
+note('Pick a location and the real solar position (azimuth and elevation) is computed from the date and time.');
+
+section('Weather (observation)');
+syncers.push(slider('Cloud cover', 0, 1, 0.01,
+  () => ui.weather.cloudCover, (v) => { ui.weather.cloudCover = v; }, (v) => v.toFixed(2)));
+syncers.push(slider('Precipitation mm/h', 0, 50, 0.5,
+  () => ui.weather.precipitation, (v) => { ui.weather.precipitation = v; }, (v) => v.toFixed(1)));
+syncers.push(chips(
+  [{ id: 'rain', label: 'Rain' }, { id: 'snow', label: 'Snow' }],
+  (id) => ui.weather.precipitationType === id,
+  (id) => { ui.weather.precipitationType = id as 'rain' | 'snow'; },
+));
+syncers.push(slider('Wind m/s', 0, 40, 0.5,
+  () => ui.weather.windSpeed, (v) => { ui.weather.windSpeed = v; }, (v) => v.toFixed(1)));
+syncers.push(slider('Thunder', 0, 1, 0.01,
+  () => ui.weather.thunder, (v) => { ui.weather.thunder = v; }, (v) => v.toFixed(2)));
+syncers.push(slider('Visibility km', 0.2, 45, 0.2,
+  () => ui.weather.visibility, (v) => { ui.weather.visibility = v; }, (v) => v.toFixed(1)));
+syncers.push(slider('Convection', 0, 1, 0.01,
+  () => ui.weather.convection, (v) => { ui.weather.convection = v; }, (v) => v.toFixed(2)));
+
+section('Cloud genera (the ten types)');
+syncers.push(chips(
+  [{ id: 'auto', label: 'From cloud cover' }, { id: 'manual', label: 'Set directly' }],
+  (id) => ui.cloudMode === id,
+  (id) => {
+    // carry the current mix over when switching auto → manual, so it's a starting point to tweak from
+    if (id === 'manual' && ui.cloudMode === 'auto') {
+      for (const g of CLOUD_GENERA_IDS) ui.clouds[g] = sky.state.clouds[g];
+    }
+    ui.cloudMode = id as 'auto' | 'manual';
+  },
+));
+const genusRows = CLOUD_GENERA_IDS.map((g) => {
+  const info = CLOUD_GENERA[g];
+  return slider(`${cloudGenusLabel(g).label} ${info.abbr}`, 0, 1, 0.01,
+    () => ui.clouds[g], (v) => { ui.clouds[g] = v; ui.cloudMode = 'manual'; }, (v) => v.toFixed(2));
+});
+syncers.push(...genusRows);
+
+section('Cumulonimbus companion forms');
+syncers.push(chips(
+  [{ id: 'auto', label: 'From development' }, { id: 'manual', label: 'Set directly' }],
+  (id) => ui.featureMode === id,
+  (id) => {
+    if (id === 'manual' && ui.featureMode === 'auto') {
+      ui.features = { ...sky.state.features, lenticular: ui.features.lenticular, distance: ui.features.distance, softness: ui.features.softness };
+    }
+    ui.featureMode = id as 'auto' | 'manual';
+  },
+));
+syncers.push(slider('Anvil', 0, 1, 0.01,
+  () => ui.features.anvil, (v) => { ui.features.anvil = v; ui.featureMode = 'manual'; }, (v) => v.toFixed(2)));
+syncers.push(slider('Veil', 0, 1, 0.01,
+  () => ui.features.velum, (v) => { ui.features.velum = v; ui.featureMode = 'manual'; }, (v) => v.toFixed(2)));
+syncers.push(slider('Lenticular banks', 0, 1, 0.01,
+  () => ui.features.lenticular, (v) => { ui.features.lenticular = v; }, (v) => v.toFixed(2)));
+note('How far off the storm stands: near, its base high over the horizon and the '
+  + 'anvil spreading overhead; far, a small tower on the horizon, washed into its haze.');
+syncers.push(slider('Distance', 0, 1, 0.01,
+  () => ui.features.distance, (v) => { ui.features.distance = v; }, (v) => v.toFixed(2)));
+note('How soft the volumetric towers are: 0 the cauliflower, crisp lobes and outlines; '
+  + '1 toward cotton candy, a fuzzy, tufted edge the sky shows through a little and light '
+  + 'wrapping round the lobes. The 2D towers ignore it.');
+syncers.push(slider('Softness', 0, 1, 0.01,
+  () => ui.features.softness, (v) => { ui.features.softness = v; }, (v) => v.toFixed(2)));
+note('How the towers are drawn. Volumetric: ray-marched in depth, turrets standing in '
+  + 'front of one another, lobes lit by their own shadows. 2D: a field painted with its '
+  + 'lobes and shade, a little lighter. Auto: the volumetric towers, but the 2D ones '
+  + 'for a storm close overhead (distance under about 0.45), faded across. The anvil and veil stay 2D.');
+syncers.push(chips(
+  [{ id: 'auto', label: 'Auto' }, { id: '2d', label: '2D towers' }, { id: 'volumetric', label: 'Volumetric' }],
+  (id) => sky.cumulonimbus === id,
+  (id) => { sky.cumulonimbus = cbParam(id); },
+));
+
+section('Sunset');
+note('How hard the sky burns. Warmth is the band on the sun\'s side — its strength, '
+  + 'its red, how high it climbs; glow is what the rest of the sky takes at magic '
+  + 'hour, the pink of the far side and the lavender above the band.');
+syncers.push(slider('Warmth', 0, 2, 0.01,
+  () => ui.sunset.warmth, (v) => { ui.sunset.warmth = v; }, (v) => v.toFixed(2)));
+syncers.push(slider('Glow', 0, 2, 0.01,
+  () => ui.sunset.glow, (v) => { ui.sunset.glow = v; }, (v) => v.toFixed(2)));
+
+section('Tone curve');
+note('Scene-referred: these act on linear light before it becomes display values, '
+  + 'which is the only place they mean anything. The knee is the one to watch — '
+  + 'below it the curve is exactly identity, so at 0.80 only blown highlights are '
+  + 'shaped. Bring it down and it starts being a look.');
+syncers.push(chips(
+  TONE_IDS.map((id) => ({ id, label: TONE_PRESETS[id].label })),
+  (id) => {
+    const t = TONE_PRESETS[id as ToneId];
+    return ui.tone.exposure === t.exposure && ui.tone.contrast === t.contrast
+      && ui.tone.knee === t.knee && ui.tone.bleach === t.bleach;
+  },
+  (id) => { ui.tone = { ...TONE_PRESETS[id as ToneId] }; },
+));
+syncers.push(slider('Exposure (stops)', -2, 2, 0.05,
+  () => ui.tone.exposure, (v) => { ui.tone.exposure = v; }, (v) => v.toFixed(2)));
+syncers.push(slider('Contrast @18%', 0.5, 1.8, 0.01,
+  () => ui.tone.contrast, (v) => { ui.tone.contrast = v; }, (v) => v.toFixed(2)));
+syncers.push(slider('Shoulder knee', 0.05, 0.99, 0.01,
+  () => ui.tone.knee, (v) => { ui.tone.knee = v; }, (v) => v.toFixed(2)));
+syncers.push(slider('Highlight bleach', 0, 1, 0.01,
+  () => ui.tone.bleach, (v) => { ui.tone.bleach = v; }, (v) => v.toFixed(2)));
+
+section('Circular polarizer');
+note('An optical filter, not a grade: it rejects light by polarization, so it '
+  + 'darkens the sky 90 degrees from the sun and leaves the clouds — whose light '
+  + 'is unpolarized — alone. Best seen on a clear or lightly clouded day with the '
+  + 'sun off to one side. The ring is aimed to darken the middle of the frame; '
+  + 'turn the angle to sweep the effect from there.');
+syncers.push(chips(
+  POLARIZER_IDS.map((id) => ({ id, label: POLARIZER_PRESETS[id].label })),
+  (id) => {
+    const p = POLARIZER_PRESETS[id as PolarizerId];
+    return ui.polarizer.strength === p.strength && ui.polarizer.angle === p.angle;
+  },
+  (id) => { ui.polarizer = { ...POLARIZER_PRESETS[id as PolarizerId] }; },
+));
+syncers.push(slider('Strength', 0, 1, 0.01,
+  () => ui.polarizer.strength, (v) => { ui.polarizer.strength = v; }, (v) => v.toFixed(2)));
+syncers.push(slider('Filter angle', 0, 180, 1,
+  () => (ui.polarizer.angle * 180) / Math.PI,
+  (v) => { ui.polarizer.angle = (v * Math.PI) / 180; }, (v) => `${v.toFixed(0)}deg`));
+syncers.push(slider('Saturation gain', 0, 1, 0.01,
+  () => ui.polarizer.saturation, (v) => { ui.polarizer.saturation = v; }, (v) => v.toFixed(2)));
+syncers.push(slider('Real stop loss', 0, 1, 0.01,
+  () => ui.polarizer.stopLoss, (v) => { ui.polarizer.stopLoss = v; }, (v) => v.toFixed(2)));
+
+section('Night sky');
+note('Only visible after dark — wind Time past sunset to see any of it.');
+syncers.push(chips(
+  CELESTIAL_IDS.map((id) => ({ id, label: CELESTIAL_PRESETS[id].label })),
+  (id) => {
+    const p = CELESTIAL_PRESETS[id as CelestialId];
+    return ui.celestial.bortle === p.bortle && ui.celestial.milkyWay === p.milkyWay
+      && ui.celestial.meteors === p.meteors && ui.celestial.aurora === p.aurora;
+  },
+  (id) => { ui.celestial = { ...CELESTIAL_PRESETS[id as CelestialId] }; },
+));
+syncers.push(slider('Light pollution (Bortle)', 1, 9, 1,
+  () => ui.celestial.bortle, (v) => { ui.celestial.bortle = v; }, (v) => String(v)));
+syncers.push(slider('Milky Way', 0, 1, 0.01,
+  () => ui.celestial.milkyWay, (v) => { ui.celestial.milkyWay = v; }, (v) => v.toFixed(2)));
+syncers.push(slider('Meteors ZHR/h', 0, 3000, 25,
+  () => ui.celestial.meteors, (v) => { ui.celestial.meteors = v; }, (v) => String(v)));
+syncers.push(slider('Aurora', 0, 1, 0.01,
+  () => ui.celestial.aurora, (v) => { ui.celestial.aurora = v; }, (v) => v.toFixed(2)));
+note('The curtains stand toward the north, and the default framing faces south: '
+  + 'drag the sky round to see them. Low activity is a faint arc on the horizon; '
+  + 'high activity folds overhead with red tops.');
+note('ZHR counts what an observer watching the WHOLE sky would see in an hour, and '
+  + 'this frame covers under a fifth of it — so an honest ZHR 150 (the Geminids at '
+  + 'their peak) puts roughly one meteor in shot every few minutes. Real, and far '
+  + 'too rare to look at. Past ~150 you have left reality; around 1500 they arrive '
+  + 'every few seconds.');
+
+section('Lens');
+note('Raindrops sitting on the lens — they collect only while it rains, and '
+  + 'bend the sky behind them. Switch them off for rain seen through clean glass.');
+syncers.push(chips(
+  [{ id: 'on', label: 'Droplets on' }, { id: 'off', label: 'Off' }],
+  (id) => (id === 'on') === (ui.lens.droplets > 0),
+  (id) => { ui.lens.droplets = id === 'on' ? 1 : 0; },
+));
+syncers.push(slider('Droplets', 0, 1, 0.01,
+  () => ui.lens.droplets, (v) => { ui.lens.droplets = v; }, (v) => v.toFixed(2)));
+
+section('Falling rain and snow');
+note('The streaks and flakes drawn falling through the air. Switching them off '
+  + 'keeps the weather itself — the gloom of rain, the whiteout of heavy snow — '
+  + 'and only stops drawing what falls through it.');
+syncers.push(chips(
+  [{ id: 'on', label: 'Falling on' }, { id: 'off', label: 'Off' }],
+  (id) => (id === 'on') === (ui.particles.precipitation > 0),
+  (id) => { ui.particles.precipitation = id === 'on' ? 1 : 0; },
+));
+syncers.push(slider('Contrails', 0, 1, 0.01,
+  () => ui.particles.contrails, (v) => { ui.particles.contrails = v; }, (v) => v.toFixed(2)));
+syncers.push(slider('Falling', 0, 1, 0.01,
+  () => ui.particles.precipitation, (v) => { ui.particles.precipitation = v; }, (v) => v.toFixed(2)));
+
+section('Ground');
+note('What lies below the horizon — tilt the camera down to see it. A sea mirrors '
+  + 'the sky: it takes the color of the hour, the sun and the moon lay a path '
+  + 'across it, and a polarizer cuts the glare off it. The chop follows the wind; '
+  + 'the swell is yours.');
+syncers.push(chips(
+  [{ id: 'land', label: 'Land' }, { id: 'sea', label: 'Sea' }],
+  (id) => (id === 'sea') === (ui.ground.sea > 0.5),
+  (id) => { ui.ground.sea = id === 'sea' ? 1 : 0; },
+));
+syncers.push(slider('Swell', 0, 1, 0.01,
+  () => ui.ground.swell, (v) => { ui.ground.swell = v; }, (v) => v.toFixed(2)));
+
+section('Foreground light');
+note('What sky.light hands to a renderer drawing in front of the sky. The figure '
+  + 'is lit from these numbers alone: fill from the dome behind the camera, the '
+  + 'frame grid bled over its edges, and a rim from the sun or moon when it is '
+  + 'ahead of the camera. Turn toward the sun at a low angle to see the rim.');
+syncers.push(chips(
+  [{ id: 'on', label: 'Show figure' }, { id: 'off', label: 'Hide' }],
+  (id) => (id === 'on') === figureEl.classList.contains('on'),
+  (id) => { figureEl.classList.toggle('on', id === 'on'); },
+));
+const swatches = document.createElement('div');
+swatches.className = 'swatches';
+host.append(swatches);
+
+section('Color filter');
+syncers.push(chips(
+  FILTER_IDS.map((id) => ({ id, label: filterLabel(id) })),
+  (id) => ui.filter === id,
+  (id) => { ui.filter = id as FilterId; },
+));
+
+section('Performance');
+note('Quality presets set the clouds\u2019 resolution and how the towers are drawn '
+  + 'together. High: clouds at full resolution, the volumetric towers. Balanced: clouds '
+  + 'at 0.75, about 0.8 of a cloudy frame. Low: clouds at 0.5 and the 2D towers, about half.');
+syncers.push(chips(
+  QUALITY_IDS.map((id) => ({ id, label: id[0].toUpperCase() + id.slice(1) })),
+  (id) => sky.quality === id,
+  (id) => { sky.quality = id as QualityPreset; },
+));
+note('Clouds are most of a cloudy frame’s cost. Drawing them at a fraction of '
+  + 'the resolution and laying them over the full-resolution sky roughly halves '
+  + 'the frame at 0.5; only their edges soften. The adaptive resolution below '
+  + 'lowers the whole frame only when a frame would overrun its GPU budget.');
+syncers.push(chips(
+  [{ id: '1', label: 'Clouds at full' }, { id: '0.75', label: '0.75' }, { id: '0.5', label: '0.5' }],
+  (id) => sky.cloudScale === Number(id),
+  (id) => { sky.cloudScale = Number(id); },
+));
+note('Crepuscular rays: shafts of sunlit air through the gaps in a deck, read off '
+  + 'the split\'s cloud stack. Best with a low sun behind broken cloud.');
+syncers.push(slider('Crepuscular rays', 0, 1, 0.01,
+  () => sky.rays, (v) => { sky.rays = v; }, (v) => v.toFixed(2)));
+note('Sky cache (experimental): open the page with ?cache=1 to draw the clouds once into a '
+  + 'map of the sky every few frames and read the frame from it, a fraction of the cost.');
+const perfEl = document.createElement('p');
+perfEl.className = 'note';
+host.append(perfEl);
+setInterval(() => {
+  perfEl.textContent = `adaptive resolution: ×${sky.resolution.toFixed(3)} — `
+    + `drawing ${canvas.width}×${canvas.height}, clouds ×${sky.cloudScale}`
+    + (new URLSearchParams(location.search).get('cache') ? (sky.skyCache ? ', sky cache on' : ', sky cache unavailable here') : '');
+}, 500);
+
+section('Camera');
+note('Drag the canvas to look around; scroll to change the field of view.');
+syncers.push(slider('Field of view', 0.22, 1.70, 0.01,
+  () => cam.fov, (v) => { cam.fov = v; sky.set({ camera: cam }); hud(); },
+  (v) => `${(v * 180 / Math.PI).toFixed(0)}°`));
+{
+  const box = document.createElement('div');
+  box.className = 'chips';
+  const reset = document.createElement('button');
+  reset.className = 'chip';
+  reset.textContent = 'Reset framing';
+  reset.addEventListener('click', () => {
+    cam.yaw = Math.PI; cam.pitch = 0.46; cam.fov = 0.86;
+    sky.set({ camera: cam }); hud(); refreshAll();
+  });
+  const bake = document.createElement('button');
+  bake.className = 'chip';
+  bake.textContent = 'Bake 6 faces';
+  bake.addEventListener('click', bakeCubemap);
+  box.append(reset, bake);
+  panel.append(box);
+}
+const faces = document.createElement('div');
+faces.id = 'faces';
+panel.append(faces);
+
+section('Resolved state');
+note('How the observation values resolved into the renderer’s 0..1 parameters.');
+const stateEl = document.createElement('div');
+stateEl.id = 'state';
+panel.append(stateEl);
+
+function showLight(l: AtmosphereLight): void {
+  const hex = (s: LightSample) => `rgb(${s.srgb.map((v) => Math.round(v * 255)).join(',')})`;
+  const rows: [string, string, string][] = [];
+  const add = (name: string, s: LightSample | undefined) => {
+    if (s) rows.push([hex(s), name, `Y ${s.luminance.toFixed(3)}`]);
+  };
+  add('frame average', l.frame?.average);
+  add('sky dome', l.environment?.sky);
+  add('horizon', l.environment?.horizon);
+  add('ground', l.environment?.ground);
+  const key = l.key ? l[l.key] : null;
+  if (key) {
+    const lin = key.color.map((c) => (c <= 0.0031308 ? c * 12.92 : 1.055 * c ** (1 / 2.4) - 0.055));
+    rows.push([`rgb(${lin.map((v) => Math.round(v * 255)).join(',')})`,
+      `key: ${l.key}`,
+      `× ${key.intensity.toFixed(2)}  ${key.view[2] > 0 ? 'ahead (backlight)' : 'behind (front light)'}`]);
+  }
+  swatches.replaceChildren(...rows.flatMap(([bg, name, v]) => {
+    const i = document.createElement('i');
+    i.style.background = bg;
+    const t = document.createElement('span');
+    t.textContent = `${name} — ${v}`;
+    return [i, t];
+  }));
+}
+
+function readout(c: Conditions): void {
+  const s = resolveConditions(c);
+  const pick = (o: Record<string, number>) => Object.entries(o)
+    .filter(([, v]) => v > 0.005)
+    .map(([k, v]) => `${k} ${v.toFixed(2)}`).join('  ') || '—';
+  stateEl.textContent = [
+    `sun       elevation ${(s.sunElevation * 180 / Math.PI).toFixed(1)}°  azimuth ${(s.sunAzimuth * 180 / Math.PI).toFixed(0)}°`,
+    `moon      elevation ${(s.moonElevation * 180 / Math.PI).toFixed(1)}°  azimuth ${(s.moonAzimuth * 180 / Math.PI).toFixed(0)}°  lit ${(s.moonPhase * 100).toFixed(0)}%`
+      + (s.moonEclipse > 0.005 ? `  eclipse ${(s.moonEclipse * 100).toFixed(0)}%` : ''),
+    `cover     ${s.cloudCover.toFixed(2)}`,
+    `rain ${s.rain.toFixed(2)}  snow ${s.snow.toFixed(2)}  wind ${s.wind.toFixed(2)}  thunder ${s.thunder.toFixed(2)}  haze ${s.haze.toFixed(2)}`,
+    `clouds    ${pick(s.clouds as unknown as Record<string, number>)}`,
+    `features  ${pick(s.features as unknown as Record<string, number>)}`,
+  ].join('\n');
+}
+
+// ── Baking a cubemap ────────────────────────────────────
+// Since drawing is ray-basis, all it takes is pointing the camera in 6
+// directions at 90° fov. This button exists just to prove the sky can be
+// exported as a skybox.
+const FACE_NAMES = ['+X E', '-X W', '+Y up', '-Y down', '+Z N', '-Z S'];
+
+function bakeCubemap(): void {
+  const tmp = document.createElement('canvas');
+  // sync: the six faces are drawn and read back within this call, so there is
+  // no later frame for an asynchronous compile to land on. By the time the
+  // button exists the live sky has compiled the same shader, so this hits the
+  // browser's shader cache and links in milliseconds
+  const renderer = new AtmosphereRenderer(tmp, { compile: 'sync' });
+  if (!renderer.available) { renderer.dispose({ loseContext: true }); return; }
+  renderer.resize(220, 220);
+  const state = sky.state;
+  faces.replaceChildren();
+  CUBE_FACE_CAMERAS.forEach((face, i) => {
+    renderer.render(performance.now() / 1000, state, face);
+    // read it back within the same task, before the next draw overwrites the buffer
+    const url = tmp.toDataURL();
+    const fig = document.createElement('figure');
+    const img = document.createElement('img');
+    img.src = url;
+    const cap = document.createElement('figcaption');
+    cap.textContent = FACE_NAMES[i];
+    fig.append(img, cap);
+    faces.append(fig);
+  });
+  // this canvas is thrown away, so hand the context back explicitly. Browsers
+  // cap live WebGL contexts and evict the oldest, which would eventually be
+  // the one drawing the sky behind this panel
+  renderer.dispose({ loseContext: true });
+}
+
+document.getElementById('toggle')!.addEventListener('click', () => {
+  panel.classList.toggle('hidden');
+});
+
+hud();
+apply();
+sky.jump();
+
+// expose these for poking at from the console (this is a sample, after all)
+(window as unknown as Record<string, unknown>).atmosphere = sky;
+(window as unknown as Record<string, unknown>).atmosphereCamera = cam;

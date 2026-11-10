@@ -1,0 +1,85 @@
+{
+  "name": "@takustaqu/atmosphere",
+  "version": "0.12.1",
+  "description": "A WebGL renderer that reproduces the sky from time and weather",
+  "type": "module",
+  "license": "MIT",
+  "author": "takustaqu",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/takustaqu/atmosphere.git"
+  },
+  "homepage": "https://github.com/takustaqu/atmosphere#readme",
+  "bugs": {
+    "url": "https://github.com/takustaqu/atmosphere/issues"
+  },
+  "keywords": [
+    "webgl",
+    "sky",
+    "clouds",
+    "weather",
+    "procedural",
+    "shader",
+    "background",
+    "skybox"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/types/src/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./react": {
+      "types": "./dist/types/examples/react/index.d.ts",
+      "default": "./dist/react/index.js"
+    },
+    "./react/styles.css": {
+      "types": "./dist/react/atmosphere.css.d.ts",
+      "default": "./dist/react/atmosphere.css"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/types/src/index.d.ts",
+  "sideEffects": [
+    "**/*.css"
+  ],
+  "files": [
+    "dist",
+    "src",
+    "examples",
+    "README.md",
+    "README.ja.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:e2e": "playwright test",
+    "build": "node scripts/build.mjs && tsc -p tsconfig.build.json",
+    "build:site": "node scripts/build-site.mjs",
+    "prepack": "pnpm run build",
+    "playground": "esbuild examples/playground/main.ts examples/controller/main.ts examples/bench/main.ts --bundle --format=esm --outdir=build --outbase=examples --watch --servedir=. --serve=8791"
+  },
+  "peerDependencies": {
+    "react": ">=18"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@playwright/test": "1.56.1",
+    "@types/react": "^19.2.15",
+    "@types/react-dom": "^19.3.0",
+    "esbuild": "^0.28.1",
+    "react-dom": "^19.2.8",
+    "typescript": "~6.0.2",
+    "vitest": "^4.1.10"
+  }
+}

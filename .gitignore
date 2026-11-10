@@ -1,0 +1,18 @@
+node_modules/
+build/
+dist/
+_site/
+coverage/
+.claude/
+
+# npm pack output
+*.tgz
+
+# macOS
+.DS_Store
+
+# package manager logs
+npm-debug.log*
+pnpm-debug.log*
+test-results/
+playwright-report/

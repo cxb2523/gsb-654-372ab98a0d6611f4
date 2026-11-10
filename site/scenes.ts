@@ -1,0 +1,94 @@
+// scenes.ts — the hero's rotation
+//
+// Each line of copy is a memory of a sky, so each one names the sky it
+// belongs to. The page doesn't cut between them: `Atmosphere.set()` eases
+// from one to the next over a few seconds, which is the thing this library
+// is actually for — a sky that keeps changing rather than a picture of one.
+//
+// Times are given without a location, so the nominal sun applies: it rises
+// at 6:00, souths at 12:00 and sets at 18:00. That keeps each number
+// readable as "roughly this hour of the day". The one exception is the
+// night, which needs a real date for its moon (see below).
+
+import type { Conditions } from '../src/index.js';
+
+export interface Scene {
+  ja: string;
+  en: string;
+  conditions: Conditions;
+}
+
+export const SCENES: readonly Scene[] = [
+  {
+    ja: '大きな音と光に怯えたあの時',
+    en: 'When the noise and the light frightened you',
+    // late afternoon, the storm already overhead
+    conditions: { time: 17.2, weather: 'thunderstorm' },
+  },
+  {
+    ja: '空に手を伸ばして、受け止めようとした時',
+    en: 'When you reached up to the sky to catch it',
+    // flat grey afternoon, snow whiting out the distance
+    conditions: { time: 15, weather: 'snow' },
+  },
+  {
+    ja: 'セミの鳴き声を聴いたあの時',
+    en: 'When the cicadas were singing',
+    // High summer, early afternoon: scattered cotton clouds with a
+    // thunderhead standing off in the distance is the sky this line is
+    // about, so the cover is light and the convection high
+    conditions: {
+      time: 13,
+      weather: { cloudCover: 0.18, convection: 0.85, windSpeed: 3, visibility: 30 },
+    },
+  },
+  {
+    ja: 'ほんの一瞬、世界が輝く時',
+    en: 'When the world shines, just for a moment',
+    // magic hour: the sun a few degrees up, everything amber
+    conditions: { time: 17.8, weather: 'fair' },
+  },
+  {
+    ja: '海に沈む夕日を見送った時',
+    en: 'When you watched the sun go down into the sea',
+    // the sun nearly down, the water below the horizon giving back the sky
+    conditions: {
+      time: 17.65,
+      weather: { cloudCover: 0.22, windSpeed: 4, visibility: 35 },
+      ground: 'sea',
+    },
+  },
+  {
+    ja: '世界が灰色に染まる時',
+    en: 'When the world turns grey',
+    conditions: { time: 12, weather: 'overcast' },
+  },
+  {
+    ja: '雲の形の移り変わりに時を感じた時',
+    en: 'When you felt time pass in the shifting of the clouds',
+    // mid-morning cumulus — the shapes visibly crumble and reassemble
+    conditions: { time: 10, weather: { cloudCover: 0.42, windSpeed: 4, visibility: 40 } },
+  },
+  {
+    ja: '夜の空に、小さな輝きが広がる事を知った時',
+    en: 'When you first saw the small lights spread across the night',
+    // The one line that is literally about the night sky, so it gets the best one
+    // there is: Bortle 1 is the bottom of the scale — no light pollution at all,
+    // which also zeroes the horizon glow — with the Milky Way at full strength.
+    //
+    // A ZHR counts the WHOLE sky and this frame is a slice of it, so 3000 is not
+    // a rate that could occur; it is what it takes for a visitor who is here for
+    // seconds rather than hours to actually see one. Chosen to be watchable, not
+    // to be real.
+    //
+    // Without a date the moon is full and up all night, right in the frame, so
+    // this night has a real one: the new moon of 12 August 2026 over Tokyo,
+    // which is also the Perseids' peak.
+    conditions: {
+      time: new Date('2026-08-12T22:30:00+09:00'),
+      location: { latitude: 35.68, longitude: 139.77 },
+      weather: 'clear',
+      celestial: { bortle: 1, milkyWay: 1, meteors: 3000 },
+    },
+  },
+];

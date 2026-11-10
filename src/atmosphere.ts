@@ -1,0 +1,712 @@
+// atmosphere.ts — atmosphere, as seen by the caller
+//
+//   const sky = new Atmosphere(canvas, { time: new Date(), weather: 'rain' });
+//   sky.set({ weather: { cloudCover: 1, precipitation: 40, windSpeed: 30 } });
+//
+// A thin layer that just bundles a canvas, the renderer, and a render loop.
+// To integrate with your own loop instead, use AtmosphereRenderer + StateAnimator directly.
+
+import { StateAnimator, type AnimatorOptions } from './animator.js';
+import { type ColorSpaceOption } from './gamut.js';
+import {
+  celestialLights, mixMeasurement,
+  type AtmosphereLight, type LightMeasurement,
+} from './light.js';
+import { ResolutionGovernor } from './governor.js';
+import { type CumulonimbusMode } from './features.js';
+import { AtmosphereRenderer, type ProbeOptions } from './renderer.js';
+import { type SkyCacheOptions } from './skycache.js';
+import { qualityOf, resolveQuality, QUALITY_PRESETS, type QualityPreset } from './quality.js';
+import {
+  resolveCamera, resolveConditions,
+  type AtmosphereState, type Camera, type Conditions,
+} from './state.js';
+
+export interface LightProbeOptions extends ProbeOptions {
+  /** measurements per second. Defaults to 10 */
+  rate?: number;
+  /**
+   * Time constant of the smoothing, in seconds. Defaults to 0.3.
+   *
+   * The probe point-samples a moving sky, so a raw series shimmers as cloud
+   * edges cross the samples. 0 takes every measurement as it comes — lightning
+   * then reaches the foreground at full strength, shimmer and all.
+   */
+  smoothing?: number;
+}
+
+export interface AtmosphereOptions extends Conditions {
+  /** frame rate cap. Defaults to 30fps (battery-friendly) since this is meant for backgrounds */
+  fps?: number;
+  /**
+   * internal resolution multiplier. fbm is expensive, so this defaults to
+   * devicePixelRatio (capped at 1.5) × 0.55, rendered small and scaled up by CSS.
+   */
+  resolutionScale?: number;
+  /**
+   * which color space to render into. Defaults to `'auto'`: Display P3 where
+   * the browser supports it, sRGB otherwise. The two look the same on an sRGB
+   * display — what P3 buys is the sun, moon, stars, lightning and magic-hour
+   * amber reaching colors sRGB can't express.
+   */
+  colorSpace?: ColorSpaceOption;
+  /** tuning for following / wind / shape evolution */
+  animator?: AnimatorOptions;
+  /** pass false to not start rendering on construction */
+  autoStart?: boolean;
+  /**
+   * Called once the shader has compiled, or failed to.
+   *
+   * The sky draws nothing until this fires — the shader is compiled off the
+   * main thread so the page stays responsive, which takes a couple of seconds
+   * the first time a browser sees it and is near-instant afterwards (browsers
+   * cache compiled shaders on disk). Use it to cross-fade the canvas in over
+   * whatever background was there, and to keep that background for good on
+   * `false`, which means this device has no WebGL or could not compile the
+   * shader at all.
+   */
+  onReady?: (available: boolean) => void;
+  /**
+   * Called each time the sky settles: every shader variant its target state
+   * needs has linked and is being drawn — after the first compile, and again
+   * after each `set()` (or `jump()`) that needed a new variant, once that one
+   * is in. Until then the frames are drawn by a stand-in, without the feature
+   * the new variant carries. The moment to bake a cubemap from the sky, or to
+   * take a screenshot of it — see {@link Atmosphere.settled} and
+   * {@link Atmosphere.whenSettled}. With the loop running it fires from the
+   * first frame drawn with the new variant; with none (a still frame,
+   * `autoStart: false`), as soon as it links.
+   *
+   * `false`, once, alongside `onReady(false)`: the sky will never draw. A
+   * `set()` that needs no new variant fires nothing.
+   */
+  onSettled?: (available: boolean) => void;
+  /**
+   * pass false to keep animating even under `prefers-reduced-motion: reduce`.
+   *
+   * On by default: a full-screen sky in constant motion is hard on users with
+   * vestibular disorders, so when the OS asks for reduced motion, `start()`
+   * draws a single still frame instead of looping, and `set()` applies
+   * changes as cuts (no transition).
+   */
+  respectReducedMotion?: boolean;
+  /**
+   * pass false to keep drawing while the canvas is out of view.
+   *
+   * On by default: a browser goes on asking for frames for a canvas scrolled
+   * out of the viewport or under `display: none`, and each one is a whole
+   * frame's GPU time that nobody sees. The sky's clocks and transitions go on
+   * as they were, the light probe with them, so it comes back as if it had been
+   * drawn all along. Turn it off for a canvas in the page that something reads
+   * from out of view — a texture for another renderer, `captureStream()`. One
+   * that isn't in the document is always drawn.
+   */
+  pauseOffscreen?: boolean;
+  /**
+   * Measure the sky's light for whatever is drawn in front of it — see
+   * {@link Atmosphere.light}. Off by default: each measurement is a small
+   * extra draw and a GPU readback. `true` takes the defaults.
+   */
+  lightProbe?: boolean | LightProbeOptions;
+  /**
+   * Called after each light measurement (at the probe's rate), with the same
+   * object {@link Atmosphere.light} would return. The place to push the
+   * numbers into another renderer's lights.
+   */
+  onLight?: (light: AtmosphereLight) => void;
+  /**
+   * Draw the clouds at this fraction of the resolution, each way, and lay
+   * them over a full-resolution sky — see {@link RendererOptions.cloudScale}.
+   * Defaults to 1. 0.5 roughly halves a cloudy frame at the price of softer
+   * cloud edges; the sky, sun, stars, rain and snow keep their resolution.
+   * Changeable at run time through {@link Atmosphere.cloudScale}.
+   */
+  cloudScale?: number;
+  /**
+   * Crepuscular rays — shafts of sunlit air fanning out from the sun through
+   * the gaps in a cloud deck — at this strength, 0..1 (`true` is 1). Defaults
+   * to 0. Needs `cloudScale` given (1 is fine), since the shafts are read off
+   * the split's cloud stack; with them on, a cloudy frame always takes the
+   * split's two passes. Changeable at run time through {@link Atmosphere.rays}.
+   */
+  rays?: boolean | number;
+  /**
+   * Compile the shader per combination of features in use (the default), or
+   * everything into one program (`false`) — see {@link RendererOptions.variants}.
+   */
+  variants?: boolean;
+  /**
+   * How the cumulonimbus's towers are drawn: `'auto'` (the default) — the
+   * volumetric tower, and the 2D one for a storm standing close overhead —
+   * or always `'2d'` (the lighter) or always `'volumetric'`. See
+   * {@link RendererOptions.cumulonimbus}.
+   */
+  cumulonimbus?: CumulonimbusMode;
+  /**
+   * A picture quality preset, setting `cloudScale` and `cumulonimbus`
+   * together: `'high'` (clouds at full resolution, the volumetric tower — the
+   * default picture), `'balanced'` (clouds at 0.75 of the resolution; a cloudy
+   * frame about 0.8 of the time) or `'low'` (clouds at 0.5 and the 2D tower;
+   * about half). Either setting given as well takes the preset's place for
+   * that setting. Changeable at run time through {@link Atmosphere.quality}.
+   */
+  quality?: QualityPreset;
+  /**
+   * **Experimental**: draw the clouds from a cache over directions,
+   * refreshed as keyframes, rather than per pixel each frame — see
+   * {@link RendererOptions.skyCache}. Off by default.
+   */
+  skyCache?: boolean | SkyCacheOptions;
+  /**
+   * Hold each frame inside a GPU time budget by lowering the resolution when
+   * it would run over, and raising it back when there is room — for large
+   * canvases (1080p, 2160p) and busy skies, where a frame that sometimes
+   * misses the display's deadline judders.
+   *
+   * `true` takes the defaults. `budget` is GPU milliseconds per frame,
+   * defaulting to three quarters of the frame interval (`fps`, counted as
+   * at most 60); `min` is the lowest it may go, each way, relative to
+   * `resolutionScale` (default 0.5). It never goes above `resolutionScale`.
+   *
+   * Under budget nothing changes at all. Needs `EXT_disjoint_timer_query`
+   * (Chrome and Edge on the desktop); elsewhere the resolution simply holds.
+   * {@link Atmosphere.resolution} reads the current factor.
+   */
+  adaptiveResolution?: boolean | { budget?: number; min?: number };
+}
+
+const DEFAULT_RESOLUTION_SCALE = () =>
+  Math.min(typeof devicePixelRatio === 'number' ? devicePixelRatio : 1, 1.5) * 0.55;
+
+export class Atmosphere {
+  private readonly canvas: HTMLCanvasElement;
+  private readonly renderer: AtmosphereRenderer;
+  private readonly animator: StateAnimator;
+  private readonly opts: AtmosphereOptions;
+
+  private target: AtmosphereState;
+  private conditions: Conditions;
+  private cam: Camera;
+
+  private raf = 0;
+  private observer: ResizeObserver | null = null;
+  private viewObserver: IntersectionObserver | null = null;
+  private inView = true;
+  private startedAt = 0;
+  private last = 0;
+  private lastDraw = 0;
+  // "the caller wants rendering" — kept separate from the raf loop, so
+  // reduced-motion can pause the loop without forgetting the caller's intent
+  private wantRunning = false;
+  // "the caller wants a picture to stay up with no loop to redraw it" — a still
+  // frame, from jump() or reduced motion. Apart from wantRunning, which a jump()
+  // before start() has not set
+  private wantStill = false;
+  private motionQuery: MediaQueryList | null = null;
+  private measured: LightMeasurement | null = null;
+  private readonly governor: ResolutionGovernor | null = null;
+  // the canvas's own size when CSS gives it none, so the adaptive resolution
+  // never reads back a size it set itself and shrinks again
+  private readonly fallbackSize: [number, number];
+  private lastProbe = -Infinity;
+  // whether onSettled last said settled, and who is waiting for it to
+  private settledSaid = false;
+  private settledWaiters: ((settled: boolean) => void)[] = [];
+  // The shader compiles asynchronously, so the frames the caller asked for
+  // before it was ready drew nothing. A running loop picks itself up on its
+  // next tick; a still frame — reduced motion, or a jump() before start() —
+  // has no next tick and has to be drawn here or never.
+  private readonly onRendererReady = (available: boolean) => {
+    if (available) this.redrawStill();
+    this.opts.onReady?.(available);
+    if (available) this.checkSettled();
+    else this.unsettle();
+  };
+  // and a still frame drawn while the variant it needed was still linking went
+  // without that variant's feature
+  private readonly onVariantLinked = () => {
+    this.redrawStill();
+    this.checkSettled();
+  };
+  private readonly onMotionChange = () => {
+    if (!this.wantRunning) return;
+    if (this.reducedMotion) {
+      this.stopLoop();
+      this.jump();               // settle any half-finished transition, draw once
+    } else {
+      this.startLoop();
+    }
+  };
+
+  constructor(canvas: HTMLCanvasElement, options: AtmosphereOptions = {}) {
+    this.canvas = canvas;
+    this.opts = options;
+    this.conditions = {
+      time: options.time,
+      location: options.location,
+      weather: options.weather,
+      filter: options.filter,
+      tone: options.tone,
+      polarizer: options.polarizer,
+      celestial: options.celestial,
+      lens: options.lens,
+      particles: options.particles,
+      ground: options.ground,
+      sunset: options.sunset,
+      sun: options.sun,
+      camera: options.camera,
+    };
+    this.target = resolveConditions(this.conditions);
+    this.cam = resolveCamera(options.camera);
+    this.fallbackSize = [canvas.width, canvas.height];
+    const adaptive = options.adaptiveResolution;
+    if (adaptive) {
+      const o = typeof adaptive === 'object' ? adaptive : {};
+      this.governor = new ResolutionGovernor({
+        budget: o.budget ?? 0.75 * (1000 / Math.min(options.fps ?? 30, 60)),
+        min: o.min,
+      });
+    }
+    const q = resolveQuality(options.quality, { cloudScale: options.cloudScale, cumulonimbus: options.cumulonimbus });
+    this.renderer = new AtmosphereRenderer(canvas, {
+      colorSpace: options.colorSpace,
+      onReady: this.onRendererReady,
+      onLinked: this.onVariantLinked,
+      cloudScale: q.cloudScale,
+      rays: options.rays === true ? 1 : options.rays === false ? 0 : options.rays,
+      variants: options.variants,
+      cumulonimbus: q.cumulonimbus,
+      timing: !!adaptive,
+      skyCache: options.skyCache,
+    });
+    // start the shader variant this sky needs linking now, not at the first frame
+    this.renderer.prepare(this.target);
+    this.animator = new StateAnimator(this.target, options.animator);
+
+    this.resize();
+    if (typeof ResizeObserver !== 'undefined') {
+      this.observer = new ResizeObserver(() => this.resize());
+      this.observer.observe(canvas);
+    }
+    if (options.respectReducedMotion !== false && typeof matchMedia !== 'undefined') {
+      this.motionQuery = matchMedia('(prefers-reduced-motion: reduce)');
+      this.motionQuery.addEventListener('change', this.onMotionChange);
+    }
+    if (options.pauseOffscreen !== false && typeof IntersectionObserver !== 'undefined') {
+      this.viewObserver = new IntersectionObserver((entries) => {
+        const inView = entries[entries.length - 1].isIntersecting;
+        const back = inView && !this.inView;
+        this.inView = inView;
+        // not left to the next tick, up to a frame interval off: what it left
+        // with is a moment long gone, and a new size has cleared the canvas of it
+        if (back && this.raf) this.draw(performance.now());
+        // (a little ahead of the edge, for a slow scroll to bring in this moment's sky)
+      }, { rootMargin: '64px' });
+      this.viewObserver.observe(canvas);
+    }
+    if (options.autoStart !== false) this.start();
+    // (under compile on the spot, everything is linked by now)
+    this.checkSettled();
+  }
+
+  /** true when the environment asks for reduced motion (and the option honors it) */
+  get reducedMotion(): boolean { return this.motionQuery?.matches ?? false; }
+
+  /** false in environments where WebGL isn't available, or once the shader has failed to compile */
+  get available(): boolean { return this.renderer.available; }
+
+  /**
+   * true once the shader has compiled and frames are actually reaching the
+   * canvas. Starts false; {@link AtmosphereOptions.onReady} fires when it flips.
+   */
+  get ready(): boolean { return this.renderer.ready; }
+
+  /**
+   * true when the sky is drawn by its own shader variants: every one the
+   * target state needs has linked, so the next frame — or a cubemap baked
+   * from this sky — carries all of its features rather than a stand-in's.
+   * Goes false on a `set()` that needs a new variant, and true again once it
+   * has linked and been drawn. Always false where {@link available} is.
+   * {@link AtmosphereOptions.onSettled} fires as it turns true.
+   */
+  get settled(): boolean { return this.settledSaid && this.renderer.isSettled(this.target); }
+
+  /**
+   * Resolves once the sky is {@link settled} — at once if it is now — with
+   * `true`; or with `false` if it never will be: WebGL is unavailable, the
+   * shader failed to compile, or the Atmosphere was disposed first.
+   *
+   * ```ts
+   * sky.set({ weather: 'storm' });
+   * if (await sky.whenSettled()) bakeCubemap();
+   * ```
+   */
+  whenSettled(): Promise<boolean> {
+    if (this.settled) return Promise.resolve(true);
+    if (!this.available) return Promise.resolve(false);
+    return new Promise((resolve) => this.settledWaiters.push(resolve));
+  }
+
+  /**
+   * See whether the sky has settled or come unsettled, and tell whoever is
+   * waiting when it settles. A link that lands with the loop running is
+   * only on the canvas at the next tick, so it is said then, from the
+   * frame; one with no loop to draw it is said now
+   */
+  private checkSettled(fromFrame = false): void {
+    // (onReady can fire inside the renderer's constructor, before it is ours)
+    if (!this.renderer) return;
+    const now = this.renderer.isSettled(this.target);
+    if (now === this.settledSaid || (now && !fromFrame && this.raf)) return;
+    this.settledSaid = now;
+    if (!now) return;
+    this.opts.onSettled?.(true);
+    this.resolveSettled(true);
+  }
+
+  /** the sky will never settle: say so, once, and let go of the waiters */
+  private unsettle(): void {
+    this.settledSaid = false;
+    this.opts.onSettled?.(false);
+    this.resolveSettled(false);
+  }
+
+  private resolveSettled(settled: boolean): void {
+    const waiters = this.settledWaiters;
+    this.settledWaiters = [];
+    for (const w of waiters) w(settled);
+  }
+
+  /** the space actually being rendered into (`'display-p3'` only where supported) */
+  get colorSpace(): PredefinedColorSpace { return this.renderer.colorSpace; }
+
+  /**
+   * The adaptive resolution's current factor, each way, on top of
+   * `resolutionScale` — 1 when it is off or has had no reason to act.
+   */
+  get resolution(): number { return this.governor?.scale ?? 1; }
+
+  /**
+   * The clouds' resolution relative to the frame, as in effect — see
+   * {@link AtmosphereOptions.cloudScale}. 1 where the device cannot split
+   * the clouds out. Setting it applies from the next frame.
+   */
+  get cloudScale(): number { return this.renderer.cloudScale; }
+  set cloudScale(v: number) {
+    this.renderer.cloudScale = v;
+    if (this.wantRunning && !this.raf) this.draw(performance.now());
+  }
+
+  /**
+   * How the cumulonimbus's towers are drawn — see
+   * {@link AtmosphereOptions.cumulonimbus}. Switching starts the variant it
+   * needs compiling; the old one draws until it has linked.
+   */
+  get cumulonimbus(): CumulonimbusMode { return this.renderer.cumulonimbus; }
+  set cumulonimbus(v: CumulonimbusMode) {
+    this.renderer.cumulonimbus = v;
+    this.renderer.prepare(this.target);
+    this.checkSettled();
+    if (this.wantRunning && !this.raf) this.draw(performance.now());
+  }
+
+  /**
+   * The quality preset the settings in effect amount to — see
+   * {@link AtmosphereOptions.quality} — or undefined when `cloudScale` and
+   * `cumulonimbus` have been set to a pair no preset names. Setting it sets
+   * both. The clouds' resolution only changes on an Atmosphere constructed
+   * with `quality` or `cloudScale` given (as {@link Atmosphere.cloudScale});
+   * without either, a preset still sets the towers.
+   */
+  get quality(): QualityPreset | undefined {
+    return qualityOf({ cloudScale: this.cloudScale, cumulonimbus: this.cumulonimbus });
+  }
+  set quality(v: QualityPreset) {
+    const p = QUALITY_PRESETS[v];
+    this.renderer.cloudScale = p.cloudScale;
+    this.cumulonimbus = p.cumulonimbus;
+  }
+
+  /**
+   * Whether the sky cache is in effect — see {@link AtmosphereOptions.skyCache}:
+   * false without the option, and where the device cannot do it, every frame
+   * then being drawn directly.
+   */
+  get skyCache(): boolean { return this.renderer.skyCache; }
+
+  /** the crepuscular rays' strength in effect — see {@link AtmosphereOptions.rays} */
+  get rays(): number { return this.renderer.rays; }
+  set rays(v: number) {
+    this.renderer.rays = v;
+    if (this.wantRunning && !this.raf) this.draw(performance.now());
+  }
+
+  /**
+   * A snapshot of the current (mid-transition) state.
+   *
+   * The animator mutates its state in place every frame, so this returns a
+   * copy — safe to hold on to and compare across frames. For a zero-copy live
+   * view (e.g. a custom render loop), use `StateAnimator.current` directly.
+   */
+  get state(): Readonly<AtmosphereState> {
+    const c = this.animator.current;
+    return {
+      ...c,
+      clouds: { ...c.clouds },
+      features: { ...c.features },
+      filter: { ...c.filter, tint: [...c.filter.tint] },
+      tone: { ...c.tone },
+      polarizer: { ...c.polarizer },
+      celestial: {
+        ...c.celestial,
+        radiant: c.celestial.radiant ? [c.celestial.radiant[0], c.celestial.radiant[1]] : null,
+      },
+      lens: { ...c.lens },
+      particles: { ...c.particles },
+      ground: { ...c.ground },
+      sunset: { ...c.sunset },
+      sun: { ...c.sun },
+    };
+  }
+
+  /** the direction currently being faced */
+  get camera(): Readonly<Camera> { return this.cam; }
+
+  /**
+   * The sky's light, for lighting whatever stands in front of it: the sun and
+   * moon as directional lights, and — with {@link AtmosphereOptions.lightProbe}
+   * on — the frame and the dome around it as measured colors. See light.ts.
+   *
+   * The lights are computed fresh on every read, so they track the camera and
+   * the transition exactly. The measurements update at the probe's rate and
+   * are null until the first one lands (and always, with the probe off).
+   */
+  get light(): AtmosphereLight {
+    const w = this.canvas.width, h = this.canvas.height;
+    return {
+      ...celestialLights(this.animator.current, this.cam, w / Math.max(1, h)),
+      frame: this.measured?.frame ?? null,
+      environment: this.measured?.environment ?? null,
+    };
+  }
+
+  /**
+   * Measure now, without waiting for the probe's next turn and without
+   * smoothing — for a still sky, or a one-off read. Works with the probe
+   * option off too. Returns {@link light} afterwards, or null while the shader
+   * is still compiling.
+   */
+  measureLight(options: ProbeOptions = {}): AtmosphereLight | null {
+    const m = this.probe(performance.now(), { ...this.probeOptions, ...options });
+    if (!m) return null;
+    this.measured = m;
+    this.lastProbe = performance.now();
+    const light = this.light;
+    this.opts.onLight?.(light);
+    return light;
+  }
+
+  private get probeOptions(): LightProbeOptions {
+    const o = this.opts.lightProbe;
+    return typeof o === 'object' ? o : {};
+  }
+
+  private probe(t: number, options: ProbeOptions): LightMeasurement | null {
+    return this.renderer.probe(
+      (t - (this.startedAt || t)) / 1000,
+      this.animator.current,
+      this.cam,
+      this.animator.wind,
+      this.animator.evolution,
+      options,
+    );
+  }
+
+  /**
+   * update the target. Only the given fields change, transitioning over a few
+   * seconds (under reduced motion the change applies as a cut instead)
+   */
+  set(c: Conditions): void {
+    this.applyConditions(c);
+    // with the loop stopped by reduced motion, a transition would never be
+    // drawn — apply the new target to the still frame directly
+    if (this.wantRunning && !this.raf && this.reducedMotion) {
+      this.animator.jump(this.target);
+      this.draw(performance.now());
+    }
+  }
+
+  /** apply instantly, with no transition (for initial display, or a scene cut) */
+  jump(c: Conditions = {}): void {
+    this.applyConditions(c);
+    this.animator.jump(this.target);
+    this.wantStill = true;
+    this.draw(performance.now());
+  }
+
+  /**
+   * Draw the still frame on show over again, if one is: the same moment, so a
+   * redraw moves nothing. With the loop running its next tick will do.
+   */
+  private redrawStill(): void {
+    if (this.raf || !this.wantStill) return;
+    this.draw(this.startedAt ? this.last : performance.now());
+  }
+
+  private applyConditions(c: Conditions): void {
+    this.conditions = { ...this.conditions, ...c };
+    this.target = resolveConditions(this.conditions);
+    if (c.camera) this.cam = resolveCamera({ ...this.cam, ...c.camera });
+    // a feature the new target brings in gets its variant compiling now,
+    // ahead of the transition that will cross its threshold
+    this.renderer.prepare(this.target);
+    // (and the sky is unsettled from now until it links)
+    this.checkSettled();
+  }
+
+  /** recompute internal resolution from the canvas's displayed size */
+  resize(): void {
+    const { width, height } = this.canvas;
+    this.applySize();
+    // a new size has cleared the canvas, and a still frame has no next tick
+    if (this.canvas.width !== width || this.canvas.height !== height) this.redrawStill();
+  }
+
+  private applySize(): void {
+    const [w, h] = this.fullSize();
+    const g = this.resolution;
+    this.renderer.resize(Math.max(1, Math.round(w * g)), Math.max(1, Math.round(h * g)));
+  }
+
+  /** the internal size at the configured resolutionScale, before any adaptive reduction */
+  private fullSize(): [number, number] {
+    const scale = this.opts.resolutionScale ?? DEFAULT_RESOLUTION_SCALE();
+    const w = this.canvas.clientWidth || this.fallbackSize[0];
+    const h = this.canvas.clientHeight || this.fallbackSize[1];
+    return [Math.max(1, Math.round(w * scale)), Math.max(1, Math.round(h * scale))];
+  }
+
+  start(): void {
+    if (!this.available) return;
+    this.wantRunning = true;
+    if (this.reducedMotion) {
+      // a still sky: settle the transition and draw exactly one frame
+      this.jump();
+      return;
+    }
+    this.startLoop();
+  }
+
+  /** stop the render loop (let the GPU rest). State is preserved */
+  stop(): void {
+    this.wantRunning = false;
+    this.wantStill = false;
+    this.stopLoop();
+  }
+
+  private startLoop(): void {
+    if (this.raf) return;
+    const now = performance.now();
+    if (!this.startedAt) this.startedAt = now;
+    this.last = now;
+    const tick = (t: number) => {
+      this.raf = requestAnimationFrame(tick);
+      const interval = 1000 / (this.opts.fps ?? 30);
+      const elapsed = t - this.lastDraw;
+      if (elapsed < interval) return;
+      // carry the remainder instead of resetting to t: with rAF quantized to
+      // the display's refresh, "t - lastDraw < interval" alone rounds a 30fps
+      // cap on a 120Hz display down to 24fps
+      this.lastDraw = t - (elapsed % interval);
+      this.draw(t);
+    };
+    this.raf = requestAnimationFrame(tick);
+  }
+
+  private stopLoop(): void {
+    if (!this.raf) return;
+    cancelAnimationFrame(this.raf);
+    this.raf = 0;
+  }
+
+  private draw(t: number): void {
+    // jump() can be called before start(). Pin the reference time here
+    if (!this.startedAt) { this.startedAt = t; this.last = t; }
+    // (a draw on the clock, not on a tick, may be followed by a tick stamped earlier)
+    const dt = Math.max(0, Math.min(0.2, (t - this.last) / 1000));
+    this.last = t;
+    this.animator.step(this.target, dt);
+    // A meteor only reads as a meteor because it moves. Under reduced motion the
+    // loop draws a single still frame, so one caught mid-flight would sit there
+    // as a scratch across the sky — suppress them rather than freeze them.
+    if (this.reducedMotion) this.animator.current.celestial.meteors = 0;
+    if (this.opts.lightProbe) this.maybeProbe(t);
+    // Out of view, only a running loop's frames go undrawn: a still frame has no
+    // next tick to come back on. (A canvas outside the document never intersects
+    // anything, and whoever made it means to read it)
+    if (this.raf && !this.inView && this.canvas.isConnected) { this.checkSettled(true); return; }
+    this.renderer.render(
+      (t - this.startedAt) / 1000,
+      this.animator.current,
+      this.cam,
+      this.animator.wind,
+      this.animator.evolution,
+    );
+    if (this.governor) {
+      // results trail the frames that made them by a frame or two; the
+      // governor reads them per pixel, so a resize in between is no matter
+      const times = this.renderer.takeGpuTimes();
+      if (times.length) {
+        const [w, h] = this.fullSize();
+        const before = this.governor.scale;
+        if (this.governor.update(times, w * h, t) !== before) this.applySize();
+      }
+    }
+    // (a look over the variants in hand while nothing is linking)
+    this.checkSettled(true);
+  }
+
+  /**
+   * Take a light measurement if one is due, folded into the running average.
+   *
+   * Before the frame's own draw on purpose: readPixels waits for everything
+   * queued ahead of it, and the tiny probe is far cheaper to wait on than the
+   * full frame. A still frame (reduced motion, jump()) always measures and
+   * takes the result unsmoothed — there is no series for it to belong to.
+   */
+  private maybeProbe(t: number): void {
+    const o = this.probeOptions;
+    const still = !this.raf;
+    const interval = 1000 / Math.max(0.1, o.rate ?? 10);
+    if (!still && t - this.lastProbe < interval) return;
+    const m = this.probe(t, o);
+    if (!m) return;
+    const tau = Math.max(0, o.smoothing ?? 0.3);
+    // the gap since the last measurement, not this frame's dt: they are a probe interval apart
+    const gap = Math.min(1, (t - this.lastProbe) / 1000);
+    const k = still || !this.measured || tau === 0 ? 1 : 1 - Math.exp(-gap / tau);
+    this.measured = this.measured ? mixMeasurement(this.measured, m, k) : m;
+    this.lastProbe = t;
+    this.opts.onLight?.(this.light);
+  }
+
+  /**
+   * Stop drawing and release resources.
+   *
+   * @param options.loseContext see {@link AtmosphereRenderer.dispose}. Turn it
+   *   on only for a throwaway canvas; a canvas that gets remounted should keep
+   *   its context.
+   */
+  dispose(options: { loseContext?: boolean } = {}): void {
+    this.stop();
+    this.observer?.disconnect();
+    this.observer = null;
+    this.viewObserver?.disconnect();
+    this.viewObserver = null;
+    this.motionQuery?.removeEventListener('change', this.onMotionChange);
+    this.motionQuery = null;
+    this.renderer.dispose(options);
+    this.settledSaid = false;
+    this.resolveSettled(false);
+  }
+}
