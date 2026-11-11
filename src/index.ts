@@ -133,6 +133,20 @@ export {
 } from './light.js';
 
 export {
+  moonlightReport,
+  eclipseLevel,
+  PENUMBRAL_LIMIT,
+  TOTAL_LIMIT,
+  FILL_GRID_WEIGHT,
+  MOONLIGHT_FILL_CLEAR,
+  MOONLIGHT_FILL_COPPER,
+  type EclipseLevel,
+  type FillGridFallback,
+  type FillScreenSample,
+  type MoonlightReport,
+} from './moonlight.js';
+
+export {
   resolveLens,
   DEFAULT_LENS,
   type Lens,
